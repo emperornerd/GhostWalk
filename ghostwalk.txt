@@ -1,0 +1,485 @@
+/*
+ * PROJECT: Ghost Walk (Privacy & Anonymity Shield)
+ * HARDWARE: ESP32 with TFT Display
+ * VERSION: 5.6 - Display Always On
+ * PURPOSE: Generates cover traffic and obfuscates real device signatures.
+ */
+
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_system.h>
+#include <esp_wifi_types.h> 
+#include <esp_mac.h> 
+#include <vector>
+#include <algorithm>
+#include <TFT_eSPI.h> 
+#include <SPI.h>
+
+// --- OPERATIONAL CONFIGURATION ---
+#define ENABLE_PASSIVE_SCAN true      
+#define ENABLE_SSID_REPLICATION true  
+#define ENABLE_LIFECYCLE_SIM true     
+#define ENABLE_SEQUENCE_GAPS true     
+#define ENABLE_BEACON_EMULATION true  
+
+// --- TRAFFIC INTENSITY ---
+const int STATEFUL_POOL_SIZE = 1000;
+const int DORMANT_POOL_SIZE = 2000;
+const int PACKETS_PER_HOP = 14;
+
+const int COVER_TRAFFIC_SIZE = 19000; 
+const int PACKETS_PER_COVER_HOP = 50;
+const int LIFECYCLE_INTERVAL_MS = 3500; 
+
+// --- GLOBALS ---
+TFT_eSPI tft = TFT_eSPI();
+
+int currentChannel = 1;
+unsigned long lastChannelHop = 0;
+unsigned long lastLifecycleRun = 0;
+unsigned long lastUiUpdateTime = 0;
+unsigned long totalPacketCount = 0;
+unsigned long learnedDataCount = 0;
+const unsigned long CHANNEL_HOP_INTERVAL_MS = 220;
+
+// --- DATA POOLS ---
+const char* SEED_SSIDS[] = {
+  "xfinitywifi", "Starbucks WiFi", "attwifi", "Google Starbucks", 
+  "iPhone", "AndroidAP", "Guest", "linksys", "netgear",
+  "Free Public WiFi", "T-Mobile", 
+  "Home", "Office", "eduroam", "CableWiFi", "Spectrum",
+  "optimumwifi", "CoxWiFi", "Lowe's Wi-Fi", "Target Guest Wi-Fi",
+  "McDonalds Free WiFi", "BURGER KING FREE WIFI", "Subway WiFi", 
+  "PaneraBread_WiFi", "Airport_Free_WiFi", "Public_Library",
+  "Hotel_Guest_Network", "Walmart_WiFi", "The Coffee Bean" 
+};
+const int NUM_SEED_SSIDS = 29;
+
+// VENDOR PROFILES
+struct VendorProfile {
+    uint8_t oui[3];
+    uint8_t type; 
+};
+
+const VendorProfile US_VENDORS[] = {
+    // APPLE
+    {{0x00, 0x17, 0xF2}, 0}, {{0x40, 0x9C, 0x28}, 0}, {{0xFC, 0xFC, 0x48}, 0},
+    {{0x8C, 0x85, 0x90}, 0}, {{0x5C, 0x96, 0x56}, 0}, {{0x34, 0x14, 0x5F}, 0},
+    {{0x00, 0x25, 0x00}, 0}, {{0x00, 0x1E, 0xC2}, 0}, {{0xAC, 0xBC, 0x32}, 0},
+    {{0xF0, 0x98, 0x9D}, 0}, {{0xE4, 0xCE, 0x8F}, 0}, {{0xBC, 0x9F, 0xEF}, 0},
+    // SAMSUNG
+    {{0x00, 0x16, 0x32}, 1}, {{0x08, 0x37, 0x3D}, 1}, {{0xFC, 0xA1, 0x3E}, 1}, 
+    {{0x84, 0x25, 0xDB}, 1}, {{0x00, 0xE0, 0x64}, 1}, {{0x84, 0x25, 0x19}, 1},
+    {{0x24, 0xF0, 0x94}, 1}, {{0x48, 0x44, 0xF7}, 1},
+    // MOTOROLA / LENOVO
+    {{0x00, 0x14, 0x38}, 1}, {{0x14, 0x30, 0xC6}, 1}, {{0x00, 0x0E, 0xC7}, 1},
+    {{0x00, 0xFA, 0xDE}, 1}, {{0xA4, 0x70, 0xD6}, 1},
+    // GOOGLE
+    {{0x3C, 0x5C, 0x48}, 1}, {{0x8C, 0xF5, 0xA3}, 1}, {{0x00, 0x1A, 0x11}, 1},
+    // OTHER
+    {{0x00, 0x15, 0xEB}, 2}, {{0x00, 0x19, 0xC6}, 2},
+    {{0x00, 0xAA, 0x70}, 2}, {{0x34, 0xFC, 0xEF}, 2}
+};
+const int NUM_US_VENDORS = 29;
+
+std::vector<String> activeSSIDs; 
+std::vector<VendorProfile> activeVendors;
+
+struct VirtualDevice {
+    uint8_t mac[6];
+    uint16_t sequenceNumber;
+    int preferredSSIDIndex;
+    uint8_t deviceType; 
+    uint8_t txPriority; 
+    unsigned long lastSeen;
+};
+
+std::vector<VirtualDevice> activeSwarm;
+std::vector<VirtualDevice> dormantSwarm; 
+uint8_t packetBuffer[256];
+
+// --- FORWARD DECLARATIONS ---
+void updateDisplayStats();
+void setupDisplay();
+
+// --- PASSIVE SCANNER ---
+void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!ENABLE_PASSIVE_SCAN) return;
+    if (type != WIFI_PKT_MGMT) return;
+    
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint8_t* frame = pkt->payload;
+    
+    if (frame[0] != 0x40) return;
+
+    // 1. Learn OUI
+    if (activeVendors.size() < 50) {
+        bool known = false;
+        for (auto& v : activeVendors) {
+            if (v.oui[0] == frame[10] && v.oui[1] == frame[11] && v.oui[2] == frame[12]) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            VendorProfile vp;
+            vp.oui[0] = frame[10]; vp.oui[1] = frame[11]; vp.oui[2] = frame[12];
+            vp.type = 1; 
+            activeVendors.push_back(vp);
+            learnedDataCount++;
+        }
+    }
+
+    // 2. Learn SSIDs
+    if (ENABLE_SSID_REPLICATION && activeSSIDs.size() < 100) {
+        int pos = 24;
+        if (frame[pos] == 0x00) {
+            int len = frame[pos+1];
+            if (len > 1 && len < 32) {
+                char ssidBuf[33];
+                memcpy(ssidBuf, &frame[pos+2], len);
+                ssidBuf[len] = '\0';
+                String ssidStr = String(ssidBuf);
+                
+                bool known = false;
+                for (auto& s : activeSSIDs) { if (s.equals(ssidStr)) known = true; }
+                
+                if (!known) {
+                    activeSSIDs.push_back(ssidStr);
+                    learnedDataCount++;
+                }
+            }
+        }
+    }
+}
+
+// --- IDENTITY GENERATOR ---
+void generateNewIdentity(VirtualDevice& vd) {
+    const VendorProfile* profile;
+    if (ENABLE_PASSIVE_SCAN && !activeVendors.empty() && random(100) < 30) {
+        profile = &activeVendors[random(activeVendors.size())];
+    } else {
+        profile = &US_VENDORS[random(NUM_US_VENDORS)];
+    }
+    
+    vd.mac[0] = profile->oui[0]; vd.mac[1] = profile->oui[1];
+    vd.mac[2] = profile->oui[2];
+    vd.mac[3] = random(0, 256); vd.mac[4] = random(0, 256);
+    vd.mac[5] = random(0, 256);
+    vd.deviceType = profile->type;
+    
+    vd.sequenceNumber = random(0, 4096);
+    
+    if (random(100) < 65) {
+        vd.preferredSSIDIndex = random(activeSSIDs.size());
+    } else {
+        vd.preferredSSIDIndex = -1; 
+    }
+    
+    vd.txPriority = random(0, 11);
+    if (vd.txPriority > 8) vd.txPriority = random(8, 11);
+}
+
+void initSwarm() {
+    for (int i=0; i<NUM_SEED_SSIDS; i++) activeSSIDs.push_back(SEED_SSIDS[i]);
+    
+    activeSwarm.reserve(STATEFUL_POOL_SIZE);
+    dormantSwarm.reserve(DORMANT_POOL_SIZE);
+    
+    for(int i=0; i<STATEFUL_POOL_SIZE; i++) {
+        VirtualDevice vd;
+        generateNewIdentity(vd);
+        activeSwarm.push_back(vd);
+    }
+
+    Serial.println("\n--- Initialized Ghost Walk Swarm ---");
+    Serial.printf("Total virtual devices: %d\n", activeSwarm.size());
+}
+
+// --- LIFECYCLE MANAGEMENT ---
+void processLifecycle() {
+    if (!activeSwarm.empty()) {
+        int idx = random(activeSwarm.size());
+        VirtualDevice leaving = activeSwarm[idx];
+        leaving.lastSeen = millis();
+        
+        if (dormantSwarm.size() < DORMANT_POOL_SIZE) {
+            dormantSwarm.push_back(leaving);
+        } else {
+            dormantSwarm[random(dormantSwarm.size())] = leaving;
+        }
+        activeSwarm.erase(activeSwarm.begin() + idx);
+    }
+    
+    VirtualDevice arriving;
+    if (ENABLE_LIFECYCLE_SIM && !dormantSwarm.empty() && random(100) < 50) {
+        int dIdx = random(dormantSwarm.size());
+        arriving = dormantSwarm[dIdx];
+        dormantSwarm.erase(dormantSwarm.begin() + dIdx);
+        arriving.sequenceNumber = (arriving.sequenceNumber + random(50, 500)) % 4096;
+    } else {
+        generateNewIdentity(arriving);
+    }
+    activeSwarm.push_back(arriving);
+}
+
+// --- PACKET CONSTRUCTION ---
+int buildProbePacket(uint8_t* buf, VirtualDevice& vd, int channel, bool useDirected) {
+    buf[0] = 0x40; 
+    buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x00;
+    memset(&buf[4], 0xFF, 6);   
+    memcpy(&buf[10], vd.mac, 6);
+    memset(&buf[16], 0xFF, 6);
+    
+    uint16_t seq = vd.sequenceNumber;
+    buf[22] = seq & 0xFF;
+    buf[23] = (seq >> 8) & 0xF0;
+    
+    int ptr = 24;
+    
+    buf[ptr++] = 0x00;
+    if (useDirected && vd.preferredSSIDIndex != -1 && vd.preferredSSIDIndex < activeSSIDs.size()) {
+        String ssid = activeSSIDs[vd.preferredSSIDIndex];
+        int len = ssid.length();
+        buf[ptr++] = len;
+        memcpy(&buf[ptr], ssid.c_str(), len);
+        ptr += len;
+    } else {
+        buf[ptr++] = 0x00;
+    }
+
+    buf[ptr++] = 0x01;
+    if (vd.deviceType == 0) { 
+        buf[ptr++] = 0x08;
+        uint8_t rates[] = {0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24};
+        memcpy(&buf[ptr], rates, 8);
+    } else { 
+        buf[ptr++] = 0x08;
+        uint8_t rates[] = {0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c};
+        memcpy(&buf[ptr], rates, 8);
+    }
+    ptr += 8;
+
+    buf[ptr++] = 0x03;
+    buf[ptr++] = 0x01; 
+    buf[ptr++] = (uint8_t)channel;
+    
+    buf[ptr++] = 45;
+    buf[ptr++] = 26;
+    memset(&buf[ptr], 0x00, 26);
+    buf[ptr] = (vd.deviceType == 0) ? 0xEF : 0x63; 
+    buf[ptr+1] = 0x01;
+    ptr += 26;
+
+    buf[ptr++] = 127; buf[ptr++] = 8;
+    memset(&buf[ptr], 0x00, 8);
+    buf[ptr] = 0x04;
+    ptr += 8;
+
+    return ptr;
+}
+
+int buildBeaconPacket(uint8_t* buf, uint8_t* mac, const String& ssid, int channel, uint16_t seqNum) {
+    buf[0] = 0x80; 
+    buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x00;
+    memset(&buf[4], 0xFF, 6);
+    memcpy(&buf[10], mac, 6);           
+    memcpy(&buf[16], mac, 6);
+    buf[22] = seqNum & 0xFF; buf[23] = (seqNum >> 8) & 0xF0;
+    
+    int ptr = 24;
+    memset(&buf[ptr], 0x00, 8); ptr += 8;
+    buf[ptr++] = 0x64; buf[ptr++] = 0x00; 
+    buf[ptr++] = 0x31; buf[ptr++] = 0x04; 
+    
+    buf[ptr++] = 0x00;
+    int len = ssid.length();
+    buf[ptr++] = len;
+    memcpy(&buf[ptr], ssid.c_str(), len);
+    ptr += len;
+    
+    buf[ptr++] = 0x01; buf[ptr++] = 0x04;
+    uint8_t rates[] = {0x82, 0x84, 0x8b, 0x96};
+    memcpy(&buf[ptr], rates, 4);
+    ptr += 4;
+    
+    buf[ptr++] = 0x03; buf[ptr++] = 0x01;
+    buf[ptr++] = (uint8_t)channel;
+    return ptr;
+}
+
+int buildCoverPacket(uint8_t* buf, int channel) {
+    buf[0] = 0x40; buf[1] = 0x00;
+    buf[2] = 0x00; buf[3] = 0x00;
+    memset(&buf[4], 0xFF, 6);
+    
+    const VendorProfile* profile = &US_VENDORS[random(NUM_US_VENDORS)];
+    buf[10] = profile->oui[0]; buf[11] = profile->oui[1];
+    buf[12] = profile->oui[2];
+    buf[13] = random(0, 256); buf[14] = random(0, 256); buf[15] = random(0, 256);
+    memset(&buf[16], 0xFF, 6);
+    
+    uint16_t seq = random(0, 4096);
+    buf[22] = seq & 0xFF; buf[23] = (seq >> 8) & 0xF0;
+    
+    int ptr = 24;
+    buf[ptr++] = 0x00; buf[ptr++] = 0x00; 
+    
+    buf[ptr++] = 0x01;
+    if (profile->type == 0) { 
+        buf[ptr++] = 0x08;
+        uint8_t rates[] = {0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24};
+        memcpy(&buf[ptr], rates, 8);
+        ptr += 8;
+    } else {
+        buf[ptr++] = 0x04;
+        uint8_t rates[] = {0x82, 0x84, 0x8b, 0x96};
+        memcpy(&buf[ptr], rates, 4);
+        ptr += 4;
+    }
+
+    buf[ptr++] = 0x03; buf[ptr++] = 0x01;
+    buf[ptr++] = (uint8_t)channel;
+    return ptr;
+}
+
+// --- UI & DISPLAY ---
+
+void updateDisplayStats() {
+    tft.fillRect(5, 110, 230, 75, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(5, 110); tft.printf("--- RUNTIME METRICS ---");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(5, 125); tft.printf("Stateful Devs: %d", activeSwarm.size());
+    tft.setCursor(5, 140); tft.printf("Dormant Devs: %d", dormantSwarm.size());
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setCursor(5, 155);
+    tft.printf("TOTAL MAC POOL: %d", STATEFUL_POOL_SIZE + COVER_TRAFFIC_SIZE);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(5, 170); tft.printf("Packets Sent: %lu", totalPacketCount);
+}
+
+void setupDisplay() {
+  tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
+  tft.setCursor(5, 5); tft.println("GHOST WALK");
+  tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
+  
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  int y = 30;
+  tft.setCursor(5, y);
+  tft.printf("Scan: %s | Rep: %s | LifeSim: %s", 
+             ENABLE_PASSIVE_SCAN ? "ON" : "OFF", ENABLE_SSID_REPLICATION ? "ON" : "OFF", ENABLE_LIFECYCLE_SIM ? "ON" : "OFF");
+  y+=12;
+  tft.setCursor(5, y);
+  tft.printf("GapSim: %s | Beacon: %s | Hop: %dms", 
+             ENABLE_SEQUENCE_GAPS ? "ON" : "OFF", ENABLE_BEACON_EMULATION ? "ON" : "OFF", CHANNEL_HOP_INTERVAL_MS);
+  y+=12;
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  tft.setCursor(5, y);    tft.printf("--- CONFIGURATION ---"); y+=12;
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(5, y);
+  tft.printf("Stateful: %d | Cover: %d", STATEFUL_POOL_SIZE, COVER_TRAFFIC_SIZE); y+=12;
+  tft.setCursor(5, y);
+  tft.printf("LifeCycle: %dms | SSIDs: %d", LIFECYCLE_INTERVAL_MS, NUM_SEED_SSIDS); y+=12;
+  updateDisplayStats();
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  uint8_t mac_base[6];
+  esp_read_mac(mac_base, ESP_MAC_WIFI_STA); 
+  randomSeed(analogRead(0) * micros() + mac_base[5]);
+  
+  setupDisplay();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  if (esp_wifi_init(&cfg) != ESP_OK) {
+      Serial.println("WiFi Init Failed");
+      while(1);
+  }
+  
+  if (ENABLE_PASSIVE_SCAN) {
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(snifferCallback);
+  }
+  
+  esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  esp_wifi_start();
+  initSwarm();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastLifecycleRun > LIFECYCLE_INTERVAL_MS) {
+      lastLifecycleRun = currentMillis;
+      int rotateCount = (activeSwarm.size() * 5) / 100;
+      if (rotateCount < 1) rotateCount = 1;
+      for(int i=0; i<rotateCount; i++) processLifecycle();
+  }
+
+  int jitter = random(-30, 30);
+  if (currentMillis - lastChannelHop > (CHANNEL_HOP_INTERVAL_MS + jitter)) {
+    lastChannelHop = currentMillis;
+    currentChannel++;
+    if (currentChannel > 13) currentChannel = 1;
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+
+    for (int i = 0; i < PACKETS_PER_HOP; i++) {
+        int swarmIdx = random(activeSwarm.size());
+        VirtualDevice& vd = activeSwarm[swarmIdx];
+        
+        int burstLimit = (vd.txPriority > 7) ? random(3, 6) : 1;
+        
+        for (int j=0; j<burstLimit; j++) {
+            bool useDirected = (j > 0);
+            int pktLen = buildProbePacket(packetBuffer, vd, currentChannel, useDirected);
+            esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
+            
+            if (pktLen > 0) {
+                totalPacketCount++;
+                int step = 1;
+                if (ENABLE_SEQUENCE_GAPS && random(100) < 15) step = random(2, 6);
+                vd.sequenceNumber = (vd.sequenceNumber + step) % 4096;
+            }
+            delay(random(2, 5)); 
+        }
+        delay(1); 
+    }
+    
+    for (int i = 0; i < PACKETS_PER_COVER_HOP; i++) {
+        int pktLen = buildCoverPacket(packetBuffer, currentChannel);
+        esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
+        totalPacketCount++;
+        delay(random(1, 3));
+    }
+    
+    if (ENABLE_BEACON_EMULATION && (lastChannelHop % (CHANNEL_HOP_INTERVAL_MS * 3)) < 250) {
+        int ssidIdx = random(activeSSIDs.size());
+        String beaconSSID = activeSSIDs[ssidIdx];
+        
+        const VendorProfile* profile = &US_VENDORS[random(NUM_US_VENDORS)];
+        uint8_t mac[6];
+        mac[0] = profile->oui[0]; mac[1] = profile->oui[1]; mac[2] = profile->oui[2];
+        mac[3] = random(0, 256); mac[4] = random(0, 256); mac[5] = random(0, 256);
+        
+        uint16_t seq = random(0, 4096);
+        int pktLen = buildBeaconPacket(packetBuffer, mac, beaconSSID, currentChannel, seq);
+        esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
+        totalPacketCount++;
+    }
+  }
+  
+  if (currentMillis - lastUiUpdateTime > 2500) {
+      lastUiUpdateTime = currentMillis;
+      updateDisplayStats();
+  }
+}
