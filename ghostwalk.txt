@@ -1,8 +1,9 @@
 /*
  * PROJECT: Ghost Walk (Privacy & Anonymity Shield)
- * HARDWARE: ESP32 with TFT Display
- * VERSION: 5.6 - Display Always On
+ * HARDWARE: ESP32 with optional TFT Display
+ * VERSION: 6.0 - Hardened Anti-Tracking
  * PURPOSE: Generates cover traffic and obfuscates real device signatures.
+ * DEPLOYMENT: Crowd protection at protests/gatherings
  */
 
 #include <WiFi.h>
@@ -20,16 +21,31 @@
 #define ENABLE_SSID_REPLICATION true  
 #define ENABLE_LIFECYCLE_SIM true     
 #define ENABLE_SEQUENCE_GAPS true     
-#define ENABLE_BEACON_EMULATION true  
+#define ENABLE_BEACON_EMULATION true
+#define ENABLE_POWER_MODULATION true
+#define ENABLE_QUIET_PERIODS true
 
 // --- TRAFFIC INTENSITY ---
 const int STATEFUL_POOL_SIZE = 1000;
 const int DORMANT_POOL_SIZE = 2000;
-const int PACKETS_PER_HOP = 14;
+
+// --- RANDOMIZATION RANGES (harder to fingerprint) ---
+const int MIN_PACKETS_PER_HOP = 8;
+const int MAX_PACKETS_PER_HOP = 20;
+const int MIN_COVER_PACKETS = 30;
+const int MAX_COVER_PACKETS = 70;
 
 const int COVER_TRAFFIC_SIZE = 19000; 
-const int PACKETS_PER_COVER_HOP = 50;
-const int LIFECYCLE_INTERVAL_MS = 3500; 
+const int MIN_LIFECYCLE_MS = 2800;
+const int MAX_LIFECYCLE_MS = 5200;
+
+const int MIN_CHANNEL_HOP_MS = 150;
+const int MAX_CHANNEL_HOP_MS = 400;
+
+// --- POWER MODULATION (anti-triangulation) ---
+// Keep power high but vary slightly to make triangulation harder
+const int8_t POWER_LEVELS[] = {72, 76, 78, 80};  // 18-20 dBm (raw values)
+const int NUM_POWER_LEVELS = 4;
 
 // --- GLOBALS ---
 TFT_eSPI tft = TFT_eSPI();
@@ -38,9 +54,16 @@ int currentChannel = 1;
 unsigned long lastChannelHop = 0;
 unsigned long lastLifecycleRun = 0;
 unsigned long lastUiUpdateTime = 0;
+unsigned long lastPowerChange = 0;
+unsigned long lastQuietCheck = 0;
 unsigned long totalPacketCount = 0;
 unsigned long learnedDataCount = 0;
-const unsigned long CHANNEL_HOP_INTERVAL_MS = 220;
+unsigned long quietPeriodsCount = 0;
+
+int nextChannelHopInterval = 220;
+int nextLifecycleInterval = 3500;
+bool inQuietPeriod = false;
+unsigned long quietPeriodEnd = 0;
 
 // --- DATA POOLS ---
 const char* SEED_SSIDS[] = {
@@ -92,6 +115,7 @@ struct VirtualDevice {
     uint8_t deviceType; 
     uint8_t txPriority; 
     unsigned long lastSeen;
+    int burstVariance;  // individualized burst behavior
 };
 
 std::vector<VirtualDevice> activeSwarm;
@@ -178,6 +202,8 @@ void generateNewIdentity(VirtualDevice& vd) {
     
     vd.txPriority = random(0, 11);
     if (vd.txPriority > 8) vd.txPriority = random(8, 11);
+    
+    vd.burstVariance = random(0, 4);  // individualized timing
 }
 
 void initSwarm() {
@@ -194,6 +220,8 @@ void initSwarm() {
 
     Serial.println("\n--- Initialized Ghost Walk Swarm ---");
     Serial.printf("Total virtual devices: %d\n", activeSwarm.size());
+    Serial.printf("Power modulation: %s\n", ENABLE_POWER_MODULATION ? "ENABLED" : "DISABLED");
+    Serial.printf("Quiet periods: %s\n", ENABLE_QUIET_PERIODS ? "ENABLED" : "DISABLED");
 }
 
 // --- LIFECYCLE MANAGEMENT ---
@@ -344,26 +372,29 @@ int buildCoverPacket(uint8_t* buf, int channel) {
 }
 
 // --- UI & DISPLAY ---
-
 void updateDisplayStats() {
-    tft.fillRect(5, 110, 230, 75, TFT_BLACK);
+    tft.fillRect(5, 110, 230, 85, TFT_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.setCursor(5, 110); tft.printf("--- RUNTIME METRICS ---");
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(5, 125); tft.printf("Stateful Devs: %d", activeSwarm.size());
-    tft.setCursor(5, 140); tft.printf("Dormant Devs: %d", dormantSwarm.size());
+    tft.setCursor(5, 125); tft.printf("Stateful: %d | Dormant: %d", activeSwarm.size(), dormantSwarm.size());
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setCursor(5, 155);
-    tft.printf("TOTAL MAC POOL: %d", STATEFUL_POOL_SIZE + COVER_TRAFFIC_SIZE);
+    tft.setCursor(5, 140);
+    tft.printf("TOTAL POOL: %d", STATEFUL_POOL_SIZE + COVER_TRAFFIC_SIZE);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.setCursor(5, 170); tft.printf("Packets Sent: %lu", totalPacketCount);
+    tft.setCursor(5, 155); tft.printf("Packets: %lu | Learned: %lu", totalPacketCount, learnedDataCount);
+    tft.setCursor(5, 170); 
+    tft.setTextColor(inQuietPeriod ? TFT_RED : TFT_CYAN, TFT_BLACK);
+    tft.printf("Status: %s", inQuietPeriod ? "QUIET" : "ACTIVE");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(5, 185); tft.printf("Quiet Periods: %lu", quietPeriodsCount);
 }
 
 void setupDisplay() {
   tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
-  tft.setCursor(5, 5); tft.println("GHOST WALK");
+  tft.setCursor(5, 5); tft.println("GHOST WALK v6");
   tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
   
   tft.setTextSize(1);
@@ -374,8 +405,12 @@ void setupDisplay() {
              ENABLE_PASSIVE_SCAN ? "ON" : "OFF", ENABLE_SSID_REPLICATION ? "ON" : "OFF", ENABLE_LIFECYCLE_SIM ? "ON" : "OFF");
   y+=12;
   tft.setCursor(5, y);
-  tft.printf("GapSim: %s | Beacon: %s | Hop: %dms", 
-             ENABLE_SEQUENCE_GAPS ? "ON" : "OFF", ENABLE_BEACON_EMULATION ? "ON" : "OFF", CHANNEL_HOP_INTERVAL_MS);
+  tft.printf("GapSim: %s | Beacon: %s", 
+             ENABLE_SEQUENCE_GAPS ? "ON" : "OFF", ENABLE_BEACON_EMULATION ? "ON" : "OFF");
+  y+=12;
+  tft.setCursor(5, y);
+  tft.printf("Power Mod: %s | Quiet: %s", 
+             ENABLE_POWER_MODULATION ? "ON" : "OFF", ENABLE_QUIET_PERIODS ? "ON" : "OFF");
   y+=12;
   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
   tft.setCursor(5, y);    tft.printf("--- CONFIGURATION ---"); y+=12;
@@ -383,7 +418,7 @@ void setupDisplay() {
   tft.setCursor(5, y);
   tft.printf("Stateful: %d | Cover: %d", STATEFUL_POOL_SIZE, COVER_TRAFFIC_SIZE); y+=12;
   tft.setCursor(5, y);
-  tft.printf("LifeCycle: %dms | SSIDs: %d", LIFECYCLE_INTERVAL_MS, NUM_SEED_SSIDS); y+=12;
+  tft.printf("Hop: %d-%dms | Life: %d-%dms", MIN_CHANNEL_HOP_MS, MAX_CHANNEL_HOP_MS, MIN_LIFECYCLE_MS, MAX_LIFECYCLE_MS); y+=12;
   updateDisplayStats();
 }
 
@@ -413,56 +448,112 @@ void setup() {
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   esp_wifi_set_mode(WIFI_MODE_STA);
   esp_wifi_start();
+  
+  // Set initial random power
+  if (ENABLE_POWER_MODULATION) {
+    esp_wifi_set_max_tx_power(POWER_LEVELS[random(NUM_POWER_LEVELS)]);
+  }
+  
+  // Set initial random intervals
+  nextChannelHopInterval = random(MIN_CHANNEL_HOP_MS, MAX_CHANNEL_HOP_MS);
+  nextLifecycleInterval = random(MIN_LIFECYCLE_MS, MAX_LIFECYCLE_MS);
+  
   initSwarm();
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  if (currentMillis - lastLifecycleRun > LIFECYCLE_INTERVAL_MS) {
+  // --- QUIET PERIOD MANAGEMENT ---
+  if (ENABLE_QUIET_PERIODS) {
+    if (inQuietPeriod) {
+      if (currentMillis >= quietPeriodEnd) {
+        inQuietPeriod = false;
+        Serial.println("Exiting quiet period - ACTIVE");
+      } else {
+        delay(100);  // Just wait during quiet period
+        return;
+      }
+    }
+    
+    // Check if we should enter quiet period (0.3% chance per check, ~every 10s)
+    if (currentMillis - lastQuietCheck > 10000) {
+      lastQuietCheck = currentMillis;
+      if (random(1000) < 3) {  // 0.3% chance
+        inQuietPeriod = true;
+        quietPeriodEnd = currentMillis + random(8000, 25000);  // 8-25 seconds quiet
+        quietPeriodsCount++;
+        Serial.println("Entering quiet period - SILENT");
+      }
+    }
+  }
+
+  // --- POWER MODULATION (every 30-60 seconds, subtle variation) ---
+  if (ENABLE_POWER_MODULATION && (currentMillis - lastPowerChange > random(30000, 60000))) {
+    lastPowerChange = currentMillis;
+    int8_t newPower = POWER_LEVELS[random(NUM_POWER_LEVELS)];
+    esp_wifi_set_max_tx_power(newPower);
+  }
+
+  // --- LIFECYCLE ROTATION ---
+  if (currentMillis - lastLifecycleRun > nextLifecycleInterval) {
       lastLifecycleRun = currentMillis;
-      int rotateCount = (activeSwarm.size() * 5) / 100;
-      if (rotateCount < 1) rotateCount = 1;
+      nextLifecycleInterval = random(MIN_LIFECYCLE_MS, MAX_LIFECYCLE_MS);  // Randomize next interval
+      
+      int rotateCount = random(3, 8);  // Vary rotation count
       for(int i=0; i<rotateCount; i++) processLifecycle();
   }
 
-  int jitter = random(-30, 30);
-  if (currentMillis - lastChannelHop > (CHANNEL_HOP_INTERVAL_MS + jitter)) {
+  // --- CHANNEL HOPPING ---
+  if (currentMillis - lastChannelHop > nextChannelHopInterval) {
     lastChannelHop = currentMillis;
+    nextChannelHopInterval = random(MIN_CHANNEL_HOP_MS, MAX_CHANNEL_HOP_MS);  // Randomize next hop
+    
     currentChannel++;
     if (currentChannel > 13) currentChannel = 1;
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
 
-    for (int i = 0; i < PACKETS_PER_HOP; i++) {
+    // Randomized packet counts per hop
+    int packetsThisHop = random(MIN_PACKETS_PER_HOP, MAX_PACKETS_PER_HOP);
+    int coverPacketsThisHop = random(MIN_COVER_PACKETS, MAX_COVER_PACKETS);
+
+    // Stateful device traffic with variable timing
+    for (int i = 0; i < packetsThisHop; i++) {
         int swarmIdx = random(activeSwarm.size());
         VirtualDevice& vd = activeSwarm[swarmIdx];
         
-        int burstLimit = (vd.txPriority > 7) ? random(3, 6) : 1;
+        // Individualized burst behavior
+        int burstLimit = (vd.txPriority > 7) ? random(2, 5) : 1;
+        if (random(100) < 15) burstLimit = 1;  // Sometimes even high priority sends singles
         
         for (int j=0; j<burstLimit; j++) {
-            bool useDirected = (j > 0);
+            bool useDirected = (j > 0 && random(100) < 70);  // Not always directed
             int pktLen = buildProbePacket(packetBuffer, vd, currentChannel, useDirected);
             esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
             
             if (pktLen > 0) {
                 totalPacketCount++;
                 int step = 1;
-                if (ENABLE_SEQUENCE_GAPS && random(100) < 15) step = random(2, 6);
+                if (ENABLE_SEQUENCE_GAPS && random(100) < 20) step = random(2, 8);  // Wider gap range
                 vd.sequenceNumber = (vd.sequenceNumber + step) % 4096;
             }
-            delay(random(2, 5)); 
+            
+            // Variable inter-packet delay based on device characteristics
+            delay(random(1 + vd.burstVariance, 6 + vd.burstVariance)); 
         }
-        delay(1); 
+        delay(random(1, 4));  // Variable inter-device delay
     }
     
-    for (int i = 0; i < PACKETS_PER_COVER_HOP; i++) {
+    // Cover traffic with variable timing
+    for (int i = 0; i < coverPacketsThisHop; i++) {
         int pktLen = buildCoverPacket(packetBuffer, currentChannel);
         esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
         totalPacketCount++;
-        delay(random(1, 3));
+        delay(random(1, 4));  // Variable delay
     }
     
-    if (ENABLE_BEACON_EMULATION && (lastChannelHop % (CHANNEL_HOP_INTERVAL_MS * 3)) < 250) {
+    // Beacon emulation with randomized timing
+    if (ENABLE_BEACON_EMULATION && random(100) < 35) {  // 35% chance per hop
         int ssidIdx = random(activeSSIDs.size());
         String beaconSSID = activeSSIDs[ssidIdx];
         
@@ -478,6 +569,7 @@ void loop() {
     }
   }
   
+  // UI update
   if (currentMillis - lastUiUpdateTime > 2500) {
       lastUiUpdateTime = currentMillis;
       updateDisplayStats();
