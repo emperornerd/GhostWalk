@@ -1,4 +1,4 @@
-# Ghost Walk (Privacy & Anonymity Shield)
+# Ghost Walk: High-Fidelity Crowd Simulation
 
 > **⚠️ WARNING: READ BEFORE DEPLOYMENT**
 >
@@ -8,70 +8,69 @@
 
 ## 📡 Project Overview
 
-**Ghost Walk** is an ESP32-based firmware designed to generate massive amounts of realistic IEEE 802.11 (WiFi) cover traffic. Unlike standard "deauthers" or "spammers" which generate easily filterable random noise, Ghost Walk mimics human behavior to poison the datasets of commercial and surveillance analytics tools.
+[cite_start]**Ghost Walk** is an ESP32-based firmware designed to generate massive amounts of realistic IEEE 802.11 (WiFi) cover traffic[cite: 1].
 
-By deploying 20-50 of these units in a specific area, the system floods the environment with ~1.1 million realistic "phantom" identities. This renders MAC address collection, presence detection, and "social graph" analysis statistically useless, creating plausible deniability for every legitimate person in the vicinity.
+Unlike standard traffic generators that produce random, easily filterable noise, Ghost Walk prioritizes **Forensic Validity**. It uses strict "Era Enforcement" to ensure that simulated devices match their hardware profiles perfectly. [cite_start]A virtual device mimicking an iPhone 12 behaves exactly like a modern WiFi 6 device, while a virtual legacy IoT device restricts itself to WiFi 4 behaviors[cite: 8, 46].
 
-### Purpose
-* **Obfuscation:** Masks real device signatures by burying them in a swarm of fake traffic.
-* **Dataset Poisoning:** Increases the "cost of conviction" by corrupting the digital data collected at a location.
-* **Non-Interference:** Strictly avoids RF jamming; operates using standard 802.11 headers and timing.
+By deploying multiple units, the system floods the environment with plausible "phantom" identities, rendering MAC address collection, presence detection, and "social graph" analysis statistically unreliable.
 
 ---
 
-## 🛡️ The Strategy: "Needle in a Pile of Needles"
+## 🛡️ Operational Strategy
 
 This is **not** a stealth tool for the user holding it. It is a "chaff" dispenser for the crowd.
 
-### Who is this for?
-* **The Crowd ("Normies"):** Passive participants in demonstrations or large gatherings who wish to avoid automated inclusion in dragnet surveillance databases.
-* **Privacy Researchers:** Testing the resilience of retail analytics and tracking hardware against obfuscated datasets.
-
-### Who is this NOT for?
-* **High-Value Targets:** If you are specifically wanted, this device does not hide you. It makes you the center of an anomaly.
-* **Lone Operators:** A single unit is easily triangulated. This system relies on **volume** (20+ units) to prevent triangulation via RSSI clustering.
+* **Obfuscation:** Masks real device signatures by burying them in a swarm of highly specific, generation-accurate fake traffic.
+* [cite_start]**Deep Packet Compliance:** Generates structurally valid 802.11 frames with generation-specific Capabilities (HT/VHT/HE) to withstand Deep Packet Inspection (DPI) [cite: 97-101].
+* **Behavioral Mimicry:** Simulates the actual connection patterns of human users rather than just flooding beacons.
 
 ---
 
 ## ⚙️ Technical Features
 
-Ghost Walk goes beyond random MAC generation by implementing "Behavioral Mimicry":
+### 1. Strict Era & Generation Enforcement
+[cite_start]The firmware assigns every virtual device a specific generation (`GEN_LEGACY`, `GEN_COMMON`, `GEN_MODERN`) and Platform (`IOS`, `ANDROID`, `IoT`)[cite: 8, 9].
+* **Hardware Consistency:** A virtual device assigned a Modern Apple OUI will transmit WiFi 6 (802.11ax) capabilities (HE Caps). [cite_start]It will not transmit legacy-only flags that would identify it as a fake [cite: 126-130].
+* [cite_start]**Private Addressing:** Modern virtual devices correctly favor randomized MAC addresses (Locally Administered Bit set) over static OUIs, matching real-world iOS/Android privacy behaviors [cite: 56-58].
 
-### 1. Stateful Swarm Emulation
-Instead of spewing random packets, the system maintains a `VirtualDevice` struct for up to 1,000 active virtual identities simultaneously.
-* **Persistence:** Virtual devices maintain `sequenceNumber` continuity, making them look like established sessions rather than glitchy noise.
-* **Lifecycle Management:** Devices don't just "appear." They rotate between an `activeSwarm` and a `dormantSwarm`, simulating people naturally walking in and out of range (Arrival/Departure simulation).
+### 2. Interaction Simulation (The "Handshake" Fake)
+[cite_start]To defeat passive sniffers that ignore unconnected devices, Ghost Walk includes `ENABLE_INTERACTION_SIM`[cite: 153].
+* The swarm occasionally selects a target SSID.
+* [cite_start]It performs a full **Authentication -> Association Request -> Encrypted Data Burst** sequence [cite: 154-157].
+* This tricks intrusion detection systems (IDS) into believing the virtual device has established a valid session.
 
-### 2. Vendor Profile Mimicry (OUI)
-Security filters often ignore "random" unassigned MAC addresses. Ghost Walk utilizes a database of real OUI prefixes to impersonate specific hardware:
-* **Apple (iOS):** Mimics iPhone probe request behavior and specific data rates.
-* **Samsung/Android:** Mimics generic Android signatures.
-* **Learning Mode:** Can passively listen to the environment to learn and replicate local vendors.
+### 3. Smart Noise Floor
+To frustrate signal triangulation (RSSI) and fill airtime gaps, the device generates "Smart Noise":
+* [cite_start]**Variable TX Power:** Noise is transmitted at randomized, lower power levels (`JUNK_POWER_LEVELS`) to disrupt distance calculations[cite: 7, 72].
+* [cite_start]**Hidden Network Mimicry:** Instead of sending obvious wildcards, noise packets mimic "Hidden Network" checks using randomized strings [cite: 78-81].
 
-### 3. Realistic Traffic Patterning
-* **Sequence Gapping:** Intentionally skips sequence numbers to simulate realistic packet loss (`ENABLE_SEQUENCE_GAPS`).
-* **Probe Requests:** Generates directed and broadcast probe requests to flood "Passive Sniffers".
-* **Beacon Emulation:** (Optional) Emulates Access Points to confuse WiFi scanners.
+### 4. Weighted Identity Distribution
+[cite_start]The swarm population is statistically weighted to match a typical modern crowd profile [cite: 47-55]:
+* **45% Apple (iOS):** Uses specific Apple Vendor Tags and WiFi 6 (HE) caps where appropriate.
+* **25% Samsung (Android):** Uses Android-specific signatures.
+* **15% Legacy IoT:** Old HPs, Motorolas, and Nintendos (forced to WiFi 4/Legacy rates).
+* **15% Modern Generic:** Intel/Google/Amazon chips (forced to Modern caps).
 
 ---
 
 ## 🖥️ Hardware & Configuration
 
 ### Requirements
-* **MCU:** ESP32 (WROOM or WROVER recommended).
-* **Display:** TFT Display (e.g., TTGO T-Display) for runtime metrics.
+* **MCU:** ESP32 (WiFi 6 capable boards preferred for full HE frame fidelity).
+* **Display:** TFT Display supported via `TFT_eSPI`.
 * **Power:** LiPo battery (external).
 
 ### Key Settings (`GhostWalk.ino`)
-Adjust these based on crowd size and density:
+
+[cite_start]The system automatically manages resources based on heap availability[cite: 30].
 
 ```cpp
-// Total virtual devices per unit (Standard: 3000)
-const int STATEFUL_POOL_SIZE = 1000; 
-const int DORMANT_POOL_SIZE = 2000;
+// --- CONFIGURATION ---
+#define ENABLE_PASSIVE_SCAN true      // Learns local SSIDs to replay them
+#define ENABLE_SSID_REPLICATION true  // Mimics networks it sees
+#define ENABLE_LIFECYCLE_SIM true     // Rotates devices in/out of the pool
+#define ENABLE_INTERACTION_SIM true   // Fakes full connections (Auth/Assoc)
 
-// How "fast" the virtual crowd churns (in milliseconds)
-const int LIFECYCLE_INTERVAL_MS = 3500; 
-
-// Toggle "Learning" mode (Listen before speaking)
-#define ENABLE_PASSIVE_SCAN true
+// --- POOL SETTINGS ---
+const int STATEFUL_POOL_SIZE = 1000;  // Active devices in RAM
+const int DORMANT_POOL_SIZE = 2000;   // Devices "waiting" to arrive
