@@ -40,6 +40,13 @@
 // Note: These are "Soft Caps". If RAM is low, the system will auto-reduce.
 const int TARGET_ACTIVE_POOL = 1500;
 const int TARGET_DORMANT_POOL = 3000;
+const int MAX_SSIDS_TO_LEARN = 200;
+// NEW: Buffer to allow accumulation before forced cycling starts (Requested Delay)
+const int CYCLE_CAP_BUFFER = 5; 
+// Rate limit for learning new SSIDs (25/min = 2400ms per learn)
+const unsigned long LEARN_INTERVAL_MS = 60000 / 25; 
+// NEW: Slower rate limit for cycling when max SSIDs is achieved (6/min = 10000ms per cycle) (Requested Frequency Reduction)
+const unsigned long CYCLE_INTERVAL_MS = 10000; 
 
 // --- TRAFFIC TIMING ---
 const int MIN_PACKETS_PER_HOP = 20; 
@@ -120,6 +127,8 @@ unsigned long lastChannelHop = 0;
 unsigned long lastLifecycleRun = 0;
 unsigned long lastUiUpdateTime = 0;
 unsigned long startTime = 0;
+// NEW: Tracking for SSID learning rate limiting
+unsigned long lastSsidLearnTime = 0; 
 
 unsigned long totalPacketCount = 0;
 unsigned long learnedDataCount = 0;
@@ -611,8 +620,9 @@ void updateDisplayStats() {
     tft.printf("Band: 2.4G[%d%%] 5G[%d%%]", p2g, p5g);
 
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    // Modified: Display MAX_SSIDS_TO_LEARN in stats
     tft.setCursor(5, 147);
-    tft.printf("Found SSIDs: %lu", learnedDataCount);
+    tft.printf("Found SSIDs: %lu / %d", learnedDataCount, MAX_SSIDS_TO_LEARN);
     
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     tft.setCursor(5, 159);
@@ -694,8 +704,11 @@ void setup() {
 void loop() {
   SniffedSSID s;
   while (xQueueReceive(ssidQueue, &s, 0) == pdTRUE) {
-      if (ENABLE_SSID_REPLICATION && activeSSIDs.size() < 100 && !lowMemoryMode) {
-          String newSSID = String(s.ssid);
+      unsigned long currentMillis = millis();
+      String newSSID = String(s.ssid);
+      
+      if (ENABLE_SSID_REPLICATION && !lowMemoryMode) {
+          // 1. Check if SSID is already known
           bool known = false;
           for (auto& existing : activeSSIDs) {
               if (existing.equals(newSSID)) {
@@ -703,10 +716,31 @@ void loop() {
                   break;
               }
           }
+          
           if (!known) {
-              activeSSIDs.push_back(newSSID);
-              learnedDataCount++;
-              lastLearnedSSID = newSSID;
+              // Determine the learning interval: use slow rate (10s) if soft cap (200) is reached.
+              unsigned long requiredInterval = (activeSSIDs.size() >= MAX_SSIDS_TO_LEARN) ? 
+                                               CYCLE_INTERVAL_MS : LEARN_INTERVAL_MS;
+
+              if (activeSSIDs.size() < MAX_SSIDS_TO_LEARN + CYCLE_CAP_BUFFER) {
+                  // If below the hard limit (205), always add it (satisfies 'don't cycle out right away')
+                  activeSSIDs.push_back(newSSID);
+                  learnedDataCount++;
+                  lastLearnedSSID = newSSID;
+                  lastSsidLearnTime = currentMillis; 
+              } 
+              // At or above the hard limit (205): start cycling, but only at the (slower) required rate.
+              else if (currentMillis - lastSsidLearnTime >= requiredInterval) {
+                  // Cycle out one of the *learned* SSIDs (not the initial seed SSIDs)
+                  if (activeSSIDs.size() > NUM_SEED_SSIDS) {
+                      // Only pick from the learned SSIDs to cycle out
+                      int cycleIdx = random(NUM_SEED_SSIDS, activeSSIDs.size()); 
+                      activeSSIDs[cycleIdx] = newSSID; 
+                      lastLearnedSSID = newSSID;
+                      lastSsidLearnTime = currentMillis; 
+                      // learnedDataCount is not incremented since one was replaced, keeping the count the same
+                  }
+              }
           }
       }
   }
@@ -806,8 +840,13 @@ void loop() {
             }
         }
         
-        // MODIFIED: Router traffic reduced to 2% (from 35%)
-        if (ENABLE_BEACON_EMULATION && random(100) < 2 && !activeSSIDs.empty()) {
+        // MODIFIED: Router traffic rate is now dynamic (2% by default, 5% when soft cap (200) is reached)
+        int beaconChance = 2; // Default 2%
+        if (activeSSIDs.size() >= MAX_SSIDS_TO_LEARN) {
+             beaconChance = 5; // User requested 5% for high-density simulation
+        }
+
+        if (ENABLE_BEACON_EMULATION && random(100) < beaconChance && !activeSSIDs.empty()) {
             int ssidIdx = random(activeSSIDs.size());
             String beaconSSID = activeSSIDs[ssidIdx];
             uint8_t mac[6]; 
