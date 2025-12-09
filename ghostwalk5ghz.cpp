@@ -134,6 +134,10 @@ unsigned long totalPacketCount = 0;
 unsigned long learnedDataCount = 0;
 unsigned long interactionCount = 0; 
 unsigned long junkPacketCount = 0;
+// NEW: Stats counters for Monitor/Broadcast and Idle calc
+unsigned long sniffedPacketCount = 0;
+unsigned long activeTimeTotal = 0; 
+
 String lastLearnedSSID = "None";
 
 // Stats for TFT
@@ -228,6 +232,8 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     uint8_t* frame = pkt->payload;
+
+    sniffedPacketCount++; // Track Monitor Activity
     
     if (frame[0] != 0x40) return; // Only Probe Requests
     
@@ -639,6 +645,19 @@ void updateDisplayStats() {
     tft.setCursor(5, 175); 
     tft.printf("Uptime: %02d:%02d:%02d", hr, mn, sc);
 
+    // NEW: Monitor vs Broadcast and Idle Stats
+    unsigned long runTime = millis() - startTime;
+    float idle = 0;
+    if(runTime > 0) idle = 100.0 * (1.0 - ((float)activeTimeTotal / runTime));
+    
+    unsigned long totalAct = totalPacketCount + sniffedPacketCount;
+    int monPct = 0;
+    if(totalAct > 0) monPct = (sniffedPacketCount * 100) / totalAct;
+    
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(5, 185); 
+    tft.printf("Idle: %0.1f%% | M/B: %d/%d%%", idle, monPct, 100-monPct);
+
     tft.setCursor(5, 195); 
     if (HARDWARE_IS_C5) {
         tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
@@ -660,11 +679,8 @@ void setupDisplay() {
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   
+  // REMOVED REDUNDANT "Mode" DISPLAY LINES
   tft.setCursor(5, 30); 
-  if (HARDWARE_IS_C5) tft.printf("Mode: INTERLEAVED");
-  else tft.printf("Mode: 2.4GHz LINEAR");
-  
-  tft.setCursor(5, 42); 
   if (HARDWARE_IS_C5) tft.printf("HW: ESP32-C5 (Dual)");
   else tft.printf("HW: Standard (2.4G)");
   
@@ -758,6 +774,7 @@ void loop() {
   }
 
   if (currentMillis - lastChannelHop > nextChannelHopInterval) {
+    unsigned long hopStart = millis(); // START TIMING ACTIVE BLOCK
     lastChannelHop = currentMillis;
     nextChannelHopInterval = random(MIN_CHANNEL_HOP_MS, MAX_CHANNEL_HOP_MS);
     
@@ -863,6 +880,8 @@ void loop() {
         // MODIFIED: Reduced junk packet duration by 25-50%
         fillSilenceWithNoise(random(2 * 75 / 100, 10 * 50 / 100));
     }
+    
+    activeTimeTotal += (millis() - hopStart); // END TIMING ACTIVE BLOCK
   }
   
   if (currentMillis - lastUiUpdateTime > 2000) {
