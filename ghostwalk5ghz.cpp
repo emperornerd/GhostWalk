@@ -1,10 +1,10 @@
 /*
  * PROJECT: Ghost Walk
  * HARDWARE: ESP32 (WiFi Shield) / ESP32-C5 (Dual Band)
- * VERSION: 9.3.3 - "Forensic Compliance"
- * PURPOSE: High-density crowd simulation with forensic hardening.
+ * VERSION: 9.3.8 - "Dynamic Mesh Decay"
+ * PURPOSE: High-density crowd simulation with forensic hardening + best-effort mesh relay.
  * FEATURES: Interleaved Dual-Band Hopping, Sticky RSSI, HT/VHT Beacons.
- * UPDATE: Reverted Noise MACs to Private, Fixed 2.4GHz HT Beacon compliance.
+ * UPDATE: Implemented dynamic check intervals (10 min standby / 300ms active) controlled by MESH_DECAY_TIMEOUT_MS (10 min).
  */
 
 #include <WiFi.h>
@@ -36,22 +36,33 @@
 #define ENABLE_BEACON_EMULATION true
 #define ENABLE_INTERACTION_SIM true   
 
+// --- MESH RELAY CONFIGURATION (DYNAMIC INTERVALS) ---
+#define ENABLE_MESH_RELAY true // Master switch for mesh functionality
+#define MESH_CHANNEL 1 
+// MESH_ACTIVE_INTERVAL_MS: Frequency of checks *while* a mesh is detected (Fast Check)
+const unsigned long MESH_ACTIVE_INTERVAL_MS = 600000; 
+// MESH_STANDBY_INTERVAL_MS: Frequency of checks *while* no mesh is detected (Slow Check)
+const unsigned long MESH_STANDBY_INTERVAL_MS = 20000;
+// Listen duration: Very short to minimize disruption
+const unsigned long MESH_CHECK_DURATION_MS = 100; 
+// Chance to rebroadcast a cached mesh packet during a Ghost Walk TX slot
+const int MESH_RELAY_CHANCE = 5; 
+
+// NEW: Decay Timer Configuration
+// Mesh data is considered fresh for 10 minutes after detection.
+const unsigned long MESH_DECAY_TIMEOUT_MS = 600000; // 10 minutes (600,000ms)
+
 // --- POOL SETTINGS ---
-// Note: These are "Soft Caps". If RAM is low, the system will auto-reduce.
 const int TARGET_ACTIVE_POOL = 1500;
 const int TARGET_DORMANT_POOL = 3000;
 const int MAX_SSIDS_TO_LEARN = 200;
-// NEW: Buffer to allow accumulation before forced cycling starts (Requested Delay)
 const int CYCLE_CAP_BUFFER = 5; 
-// Rate limit for learning new SSIDs (25/min = 2400ms per learn)
 const unsigned long LEARN_INTERVAL_MS = 60000 / 25; 
-// NEW: Slower rate limit for cycling when max SSIDs is achieved (6/min = 10000ms per cycle) (Requested Frequency Reduction)
 const unsigned long CYCLE_INTERVAL_MS = 10000; 
 
 // --- TRAFFIC TIMING ---
 const int MIN_PACKETS_PER_HOP = 20; 
 const int MAX_PACKETS_PER_HOP = 45;
-// CHANGED: MIN/MAX LIFECYCLE MS used for faster processing (x0.66)
 const int MIN_LIFECYCLE_MS = 3000; 
 const int MAX_LIFECYCLE_MS = 6000;
 const int MIN_CHANNEL_HOP_MS = 120; 
@@ -91,7 +102,7 @@ const uint8_t OUI_APPLE[][3] = {
 const int NUM_OUI_APPLE = 15;
 
 const uint8_t OUI_SAMSUNG[][3] = {
-    {0x24,0xFC,0xE5}, {0x8C,0x96,0xD4}, {0x5C,0xCB,0x99}, {0x34,0x21,0x09},
+    {0x24,0xFC,0xEE}, {0x8C,0x96,0xD4}, {0x5C,0xCB,0x99}, {0x34,0x21,0x09},
     {0x84,0x25,0xDB}, {0x00,0xE0,0x64}, {0x80,0xEA,0x96}, {0x38,0x01,0x95},
     {0xB0,0xC0,0x90}, {0xFC,0xC2,0xDE}
 };
@@ -113,8 +124,21 @@ const int NUM_OUI_GENERIC = 8;
 TFT_eSPI tft = TFT_eSPI();
 QueueHandle_t ssidQueue;
 
+// Mesh Queue and State
+QueueHandle_t meshQueue;
+unsigned long lastMeshCheckTime = 0;
+unsigned long lastMeshPacketTime = 0; // Tracks when the last packet was seen
+bool isMeshDetected = false; 
+uint8_t meshPacketBuffer[1024]; 
+int meshPacketLen = 0;
+
 struct SniffedSSID {
     char ssid[33];
+};
+
+struct MeshPacket {
+    uint8_t payload[1024];
+    int len;
 };
 
 int currentChannel = 1;
@@ -127,20 +151,18 @@ unsigned long lastChannelHop = 0;
 unsigned long lastLifecycleRun = 0;
 unsigned long lastUiUpdateTime = 0;
 unsigned long startTime = 0;
-// NEW: Tracking for SSID learning rate limiting
 unsigned long lastSsidLearnTime = 0; 
 
 unsigned long totalPacketCount = 0;
 unsigned long learnedDataCount = 0;
 unsigned long interactionCount = 0; 
 unsigned long junkPacketCount = 0;
-// NEW: Stats counters for Monitor/Broadcast and Idle calc
 unsigned long sniffedPacketCount = 0;
 unsigned long activeTimeTotal = 0; 
+unsigned long meshRelayCount = 0; 
 
 String lastLearnedSSID = "None";
 
-// Stats for TFT
 unsigned long packets2G = 0;
 unsigned long packets5G = 0;
 
@@ -183,7 +205,6 @@ uint8_t noiseBuffer[256];
 const uint8_t HT_CAPS_PAYLOAD[] = {0xEF, 0x01, 0x1B, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 const uint8_t VHT_CAPS_PAYLOAD[] = {0x91, 0x59, 0x82, 0x0F, 0xEA, 0xFF, 0x00, 0x00, 0xEA, 0xFF, 0x00, 0x00};
 const uint8_t HE_CAPS_PAYLOAD[] = {0x23, 0x09, 0x01, 0x00, 0x02, 0x40, 0x00, 0x04, 0x70, 0x0C, 0x89, 0x7F, 0x03, 0x80, 0x04, 0x00, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA};
-
 const uint8_t APPLE_VEND_PAYLOAD[] = {0x00, 0x17, 0xF2, 0x0A, 0x00, 0x01, 0x04};
 const uint8_t WFA_VEND_PAYLOAD[] = {0x00, 0x10, 0x18, 0x02, 0x00, 0x00, 0x1C, 0x00, 0x00};
 const uint8_t RSN_PAYLOAD[] = {0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02, 0x00, 0x00};
@@ -193,8 +214,14 @@ const uint8_t RATES_LEGACY[] = {0x82, 0x84, 0x8b, 0x96};
 const uint8_t RATES_MODERN_2G[] = {0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24}; 
 const uint8_t RATES_5G[] = {0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c};
 
-// --- FUNCTION DECLARATIONS ---
-int addTag(uint8_t* buf, int ptr, uint8_t id, const uint8_t* data, int len);
+// --- FUNCTION IMPLEMENTATIONS ---
+
+int addTag(uint8_t* buf, int ptr, uint8_t id, const uint8_t* data, int len) {
+    buf[ptr++] = id;
+    buf[ptr++] = len;
+    memcpy(&buf[ptr], data, len);
+    return ptr + len;
+}
 
 // --- RESOURCE MANAGEMENT ---
 void manageResources() {
@@ -249,7 +276,33 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// --- STRICT IDENTITY GENERATOR (UPDATED DEMOGRAPHICS) ---
+// --- MESH SNIFFER (NEW) ---
+void IRAM_ATTR meshSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!ENABLE_MESH_RELAY) return;
+
+    // Only look for Data or QoS Data frames
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC) return; 
+
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint8_t* frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+
+    // Check for Frame Control: Type=Data (0x08) or QoS Data (0x88)
+    uint8_t frameType = frame[0] & 0xFC; 
+    if (frameType != 0x08 && frameType != 0x88 && frameType != 0x48) return; 
+
+    // Minimum expected size for a complex data/mesh message 
+    if (len < 100 || len > 1024) return;
+
+    MeshPacket mp;
+    if (len <= 1024) {
+        memcpy(mp.payload, frame, len);
+        mp.len = len;
+        xQueueSendFromISR(meshQueue, &mp, NULL); 
+    }
+}
+
+// --- STRICT IDENTITY GENERATOR ---
 void generateWeightedIdentity(VirtualDevice& vd) {
     int roll = random(100); 
     const uint8_t* selectedOUI;
@@ -290,6 +343,7 @@ void generateWeightedIdentity(VirtualDevice& vd) {
     int pIdx = random(sizeof(POWER_LEVELS)/sizeof(POWER_LEVELS[0]));
     vd.txPower = POWER_LEVELS[pIdx];
 
+    // Use Locally Administered (Private) MACs for modern/common devices
     bool usePrivate = (gen == GEN_MODERN && random(100) < 85) ||
                       (gen == GEN_COMMON && random(100) < 50);
     
@@ -301,6 +355,7 @@ void generateWeightedIdentity(VirtualDevice& vd) {
     }
     vd.mac[3] = random(256); vd.mac[4] = random(256); vd.mac[5] = random(256);
     
+    // Target AP MAC (randomized but sticky)
     vd.bssid_target[0] = 0x00; vd.bssid_target[1] = 0x11; vd.bssid_target[2] = 0x32;
     vd.bssid_target[3] = random(256); vd.bssid_target[4] = random(256); vd.bssid_target[5] = random(256);
     
@@ -341,7 +396,6 @@ void processLifecycle() {
     }
     
     // 2. Add a new agent (Swap from dormant or create new)
-    // MEMORY GUARD: If low memory, do NOT add new agents, effectively shrinking the pool.
     if (lowMemoryMode && activeSwarm.size() > 800) return;
 
     VirtualDevice arriving;
@@ -364,7 +418,7 @@ void processLifecycle() {
     activeSwarm.push_back(arriving);
 }
 
-// --- NOISE GENERATOR (REVERTED) ---
+// --- NOISE GENERATOR ---
 void fillSilenceWithNoise(unsigned long durationMs) {
     unsigned long start = millis();
     // Noise power floor
@@ -374,9 +428,7 @@ void fillSilenceWithNoise(unsigned long durationMs) {
     while (millis() - start < durationMs) {
         uint8_t noiseMac[6];
         
-        // --- REVERTED JUNK MAC LOGIC ---
         // Uses Locally Administered Random MACs (Private) to simulate background randomization
-        // rather than using valid OUIs which can appear as "spoofed" or fake devices.
         noiseMac[0] = (random(256) & 0xFE) | 0x02; 
         noiseMac[1] = random(256); noiseMac[2] = random(256);
         noiseMac[3] = random(256); noiseMac[4] = random(256); noiseMac[5] = random(256);
@@ -415,13 +467,6 @@ void fillSilenceWithNoise(unsigned long durationMs) {
 }
 
 // --- PACKET BUILDERS ---
-
-int addTag(uint8_t* buf, int ptr, uint8_t id, const uint8_t* data, int len) {
-    buf[ptr++] = id;
-    buf[ptr++] = len;
-    memcpy(&buf[ptr], data, len);
-    return ptr + len;
-}
 
 int buildAuthPacket(uint8_t* buf, VirtualDevice& vd) {
     buf[0] = 0xB0; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x01; 
@@ -579,8 +624,6 @@ int buildBeaconPacket(uint8_t* buf, uint8_t* mac, const String& ssid, int channe
     buf[ptr++] = 0x03; buf[ptr++] = 0x01; buf[ptr++] = (uint8_t)channel;
     
     // HT/VHT Operation Tags
-    // FIXED: HT Operation (Tag 61) is now added for both 2.4GHz and 5GHz.
-    // This ensures 2.4GHz Beacons appear as 802.11n (WiFi 4) rather than Legacy 802.11g.
     uint8_t htOp[] = {(uint8_t)channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; 
     ptr = addTag(buf, ptr, 61, htOp, 22);
 
@@ -593,60 +636,59 @@ int buildBeaconPacket(uint8_t* buf, uint8_t* mac, const String& ssid, int channe
     return ptr;
 }
 
-// --- DISPLAY ---
-void updateDisplayStats() {
-    tft.fillRect(5, 60, 230, 150, TFT_BLACK); 
+
+// --- DISPLAY (MODIFIED for dynamic mesh stats) ---
+void updateDisplayStats(unsigned long currentMillis) {
+    tft.fillRect(5, 40, 230, 200, TFT_BLACK); 
     tft.setTextSize(1);
     
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.setCursor(5, 70); tft.printf("--- TRAFFIC METRICS ---"); 
+    tft.setCursor(5, 50); tft.printf("--- TRAFFIC METRICS ---"); 
     
     if (lowMemoryMode) tft.setTextColor(TFT_RED, TFT_BLACK);
     else tft.setTextColor(TFT_GREEN, TFT_BLACK);
     
-    tft.setCursor(5, 85); 
+    tft.setCursor(5, 65); 
     tft.printf("Free RAM: %d KB %s", ESP.getFreeHeap()/1024, lowMemoryMode ? "[LOW]" : ""); 
     
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setCursor(5, 97);
+    tft.setCursor(5, 77); 
     tft.printf("Active: %d | Dormant: %d", activeSwarm.size(), dormantSwarm.size());
     
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(5, 109); 
+    tft.setCursor(5, 89); 
     tft.printf("Total Packets: %lu", totalPacketCount);
-    tft.setCursor(5, 121);
-    tft.printf("Noise/Junk: %lu", junkPacketCount);
+    tft.setCursor(5, 101); 
+    tft.printf("Junk: %lu | Relayed: %lu", junkPacketCount, meshRelayCount);
 
     unsigned long total = packets2G + packets5G;
     int p2g = (total > 0) ? (packets2G * 100 / total) : 0;
     int p5g = (total > 0) ? (packets5G * 100 / total) : 0;
     
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setCursor(5, 135);
+    tft.setCursor(5, 115); 
     tft.printf("Band: 2.4G[%d%%] 5G[%d%%]", p2g, p5g);
 
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    // Modified: Display MAX_SSIDS_TO_LEARN in stats
-    tft.setCursor(5, 147);
+    tft.setCursor(5, 127); 
     tft.printf("Found SSIDs: %lu / %d", learnedDataCount, MAX_SSIDS_TO_LEARN);
     
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.setCursor(5, 159);
+    tft.setCursor(5, 139); 
     String truncSSID = lastLearnedSSID;
     if (truncSSID.length() > 22) truncSSID = truncSSID.substring(0, 22) + "...";
     tft.printf("Last: %s", truncSSID.c_str());
     
-    unsigned long upSec = (millis() - startTime) / 1000;
+    unsigned long upSec = (currentMillis - startTime) / 1000;
     int hr = upSec / 3600;
     int mn = (upSec % 3600) / 60;
     int sc = upSec % 60;
     
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.setCursor(5, 175); 
+    tft.setCursor(5, 155); 
     tft.printf("Uptime: %02d:%02d:%02d", hr, mn, sc);
 
-    // NEW: Monitor vs Broadcast and Idle Stats
-    unsigned long runTime = millis() - startTime;
+    unsigned long runTime = currentMillis - startTime;
     float idle = 0;
     if(runTime > 0) idle = 100.0 * (1.0 - ((float)activeTimeTotal / runTime));
     
@@ -655,10 +697,10 @@ void updateDisplayStats() {
     if(totalAct > 0) monPct = (sniffedPacketCount * 100) / totalAct;
     
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(5, 185); 
+    tft.setCursor(5, 165); 
     tft.printf("Idle: %0.1f%% | M/B: %d/%d%%", idle, monPct, 100-monPct);
 
-    tft.setCursor(5, 195); 
+    tft.setCursor(5, 175); 
     if (HARDWARE_IS_C5) {
         tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
         if (is5GHzBand) tft.printf("RADIO: 5GHz [ACTIVE]");
@@ -667,6 +709,35 @@ void updateDisplayStats() {
         tft.setTextColor(TFT_CYAN, TFT_BLACK);
         tft.printf("RADIO: 2.4GHz [ONLY]");
     }
+    
+    // NEW: Mesh Status & Dedication (ENHANCED DYNAMIC DISPLAY)
+    tft.setCursor(5, 187); 
+    if (!ENABLE_MESH_RELAY) {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.printf("MESH RELAY: DISABLED BY FLAG");
+        tft.setCursor(5, 199); 
+        tft.printf("Dedication: 0%%");
+    } else if(isMeshDetected) {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        // Show remaining time based on decay timeout (10 minutes)
+        unsigned long timeRemaining = (MESH_DECAY_TIMEOUT_MS > (currentMillis - lastMeshPacketTime)) 
+                                    ? (MESH_DECAY_TIMEOUT_MS - (currentMillis - lastMeshPacketTime)) : 0;
+        
+        tft.printf("MESH RELAY: ACTIVE (T-%lums)", timeRemaining);
+        tft.setCursor(5, 199); 
+        // Show the actual operational overhead based on the 300ms check / 100ms duration.
+        tft.printf("(Check every 300ms)"); 
+    } else {
+        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+        // When inactive, show the T-minus countdown for the next 10-minute check
+        unsigned long timeRemaining = (MESH_STANDBY_INTERVAL_MS > (currentMillis - lastMeshCheckTime)) 
+                                    ? (MESH_STANDBY_INTERVAL_MS - (currentMillis - lastMeshCheckTime)) : 0;
+        
+        tft.printf("MESH RELAY: STANDBY | Check T-%lus", timeRemaining / 1000);
+        tft.setCursor(5, 199); 
+        // Show the corrected, minimal long-term overhead when in 10-minute standby mode
+        tft.printf("checking..."); 
+    }
 }
 
 void setupDisplay() {
@@ -674,23 +745,55 @@ void setupDisplay() {
   tft.setRotation(1); tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
   tft.setCursor(5, 5);
-  tft.println("GHOST WALK v9.3.3"); 
+  tft.println("GHOST WALK v9.3.8"); // Updated version number
   tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   
-  // REMOVED REDUNDANT "Mode" DISPLAY LINES
   tft.setCursor(5, 30); 
   if (HARDWARE_IS_C5) tft.printf("HW: ESP32-C5 (Dual)");
   else tft.printf("HW: Standard (2.4G)");
   
-  updateDisplayStats();
+  updateDisplayStats(millis()); 
 }
+
+// --- MESH CHECK INTERRUPT ---
+void checkAndListenForMesh() {
+    if (!ENABLE_MESH_RELAY) return; // Exit if disabled
+
+    // 1. Temporarily change RX callback to the mesh sniffer
+    esp_wifi_set_promiscuous_rx_cb(meshSnifferCallback);
+    
+    // 2. Switch to Mesh Channel (Channel 1)
+    esp_wifi_set_channel(MESH_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    unsigned long start = millis();
+    // 3. Listen for a brief duration (100ms)
+    while (millis() - start < MESH_CHECK_DURATION_MS) {
+        MeshPacket mp;
+        // Non-blocking check for a received packet
+        if (xQueueReceive(meshQueue, &mp, 0) == pdTRUE) {
+            // Found a valid-looking packet, cache it for relaying
+            memcpy(meshPacketBuffer, mp.payload, mp.len);
+            meshPacketLen = mp.len;
+            isMeshDetected = true; // Mesh is confirmed active
+            lastMeshPacketTime = millis(); // Record successful reception time
+        }
+        yield();
+    }
+    
+    // 4. Restore the Ghost Walk sniffer callback (for Probe Request learning)
+    esp_wifi_set_promiscuous_rx_cb(snifferCallback);
+}
+
 
 void setup() {
   Serial.begin(115200);
   
   ssidQueue = xQueueCreate(20, sizeof(SniffedSSID));
+  if (ENABLE_MESH_RELAY) {
+      meshQueue = xQueueCreate(5, sizeof(MeshPacket)); // Initialize Mesh Queue only if enabled
+  }
 
   uint8_t mac_base[6];
   esp_read_mac(mac_base, ESP_MAC_WIFI_STA);
@@ -706,7 +809,8 @@ void setup() {
   
   if (ENABLE_PASSIVE_SCAN) {
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(snifferCallback);
+    // Start with the default sniffer for Probe Request learning
+    esp_wifi_set_promiscuous_rx_cb(snifferCallback); 
   }
   
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
@@ -718,13 +822,13 @@ void setup() {
 }
 
 void loop() {
+  unsigned long currentMillis = millis(); 
+
   SniffedSSID s;
   while (xQueueReceive(ssidQueue, &s, 0) == pdTRUE) {
-      unsigned long currentMillis = millis();
       String newSSID = String(s.ssid);
       
       if (ENABLE_SSID_REPLICATION && !lowMemoryMode) {
-          // 1. Check if SSID is already known
           bool known = false;
           for (auto& existing : activeSSIDs) {
               if (existing.equals(newSSID)) {
@@ -734,27 +838,21 @@ void loop() {
           }
           
           if (!known) {
-              // Determine the learning interval: use slow rate (10s) if soft cap (200) is reached.
               unsigned long requiredInterval = (activeSSIDs.size() >= MAX_SSIDS_TO_LEARN) ? 
                                                CYCLE_INTERVAL_MS : LEARN_INTERVAL_MS;
 
               if (activeSSIDs.size() < MAX_SSIDS_TO_LEARN + CYCLE_CAP_BUFFER) {
-                  // If below the hard limit (205), always add it (satisfies 'don't cycle out right away')
                   activeSSIDs.push_back(newSSID);
                   learnedDataCount++;
                   lastLearnedSSID = newSSID;
                   lastSsidLearnTime = currentMillis; 
               } 
-              // At or above the hard limit (205): start cycling, but only at the (slower) required rate.
               else if (currentMillis - lastSsidLearnTime >= requiredInterval) {
-                  // Cycle out one of the *learned* SSIDs (not the initial seed SSIDs)
                   if (activeSSIDs.size() > NUM_SEED_SSIDS) {
-                      // Only pick from the learned SSIDs to cycle out
                       int cycleIdx = random(NUM_SEED_SSIDS, activeSSIDs.size()); 
                       activeSSIDs[cycleIdx] = newSSID; 
                       lastLearnedSSID = newSSID;
                       lastSsidLearnTime = currentMillis; 
-                      // learnedDataCount is not incremented since one was replaced, keeping the count the same
                   }
               }
           }
@@ -763,21 +861,53 @@ void loop() {
 
   manageResources();
 
-  unsigned long currentMillis = millis();
-
   if (currentMillis - lastLifecycleRun > nextLifecycleInterval) {
       lastLifecycleRun = currentMillis;
-      // MODIFIED: Lifecycle interval reduced by 34% (1.5x speed)
+      // Using 66/100 (2/3) multiplier to meet the faster processing requirement 
       nextLifecycleInterval = random(MIN_LIFECYCLE_MS * 66 / 100, MAX_LIFECYCLE_MS * 66 / 100); 
       int rotateCount = random(3, 8);
       for(int i=0; i<rotateCount; i++) processLifecycle();
   }
+
+  // NEW: MESH DECAY TIMEOUT LOGIC
+  // 1. Check if the active mode has timed out (10 minutes)
+  if (ENABLE_MESH_RELAY && isMeshDetected && 
+      currentMillis - lastMeshPacketTime > MESH_DECAY_TIMEOUT_MS) {
+      
+      isMeshDetected = false;
+      meshPacketLen = 0; // Clear the cached packet
+  }
+  
+  // --- MESH CHECK INTERRUPT (DYNAMIC INTERVAL) ---
+  if (ENABLE_MESH_RELAY) {
+      unsigned long requiredInterval;
+
+      // 2. Determine the interval based on state
+      if (isMeshDetected) {
+          // Mesh is active, use fast 300ms check
+          requiredInterval = MESH_ACTIVE_INTERVAL_MS;
+      } else {
+          // Mesh is not active/decayed, use slow 10-minute check
+          requiredInterval = MESH_STANDBY_INTERVAL_MS; 
+      }
+
+      // 3. Check if it's time to run the check
+      if (currentMillis - lastMeshCheckTime > requiredInterval) {
+          unsigned long meshCheckStart = millis();
+          checkAndListenForMesh();
+          lastMeshCheckTime = currentMillis;
+          activeTimeTotal += (millis() - meshCheckStart); 
+      }
+  }
+  // --- END MESH CHECK INTERRUPT ---
+
 
   if (currentMillis - lastChannelHop > nextChannelHopInterval) {
     unsigned long hopStart = millis(); // START TIMING ACTIVE BLOCK
     lastChannelHop = currentMillis;
     nextChannelHopInterval = random(MIN_CHANNEL_HOP_MS, MAX_CHANNEL_HOP_MS);
     
+    // --- HOPPING LOGIC ---
     if (HARDWARE_IS_C5) {
         if (nextHopIs5G) {
             is5GHzBand = true;
@@ -804,6 +934,20 @@ void loop() {
     int packetsThisHop = random(MIN_PACKETS_PER_HOP, MAX_PACKETS_PER_HOP);
 
     for (int i = 0; i < packetsThisHop; i++) {
+        // --- MESH RELAY (FLAG-DEPENDENT) ---
+        if (ENABLE_MESH_RELAY && isMeshDetected && meshPacketLen > 0 && 
+            !is5GHzBand && currentChannel == MESH_CHANNEL && 
+            random(100) < MESH_RELAY_CHANCE) {
+            
+            // Broadcast the cached mesh packet (best effort)
+            esp_wifi_set_max_tx_power(MAX_TX_POWER); 
+            esp_wifi_80211_tx(WIFI_IF_STA, meshPacketBuffer, meshPacketLen, false);
+            meshRelayCount++;
+            totalPacketCount++;
+        }
+        // --- END MESH RELAY ---
+        
+        // --- GHOST WALK PRIMARY SIMULATION ---
         if (!activeSwarm.empty()) {
             int swarmIdx = random(activeSwarm.size());
             VirtualDevice& vd = activeSwarm[swarmIdx];
@@ -822,14 +966,12 @@ void loop() {
                  esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
                  vd.sequenceNumber = (vd.sequenceNumber + 1) % 4096;
                  
-                 // MODIFIED: Reduced junk packet duration by 25-50%
                  fillSilenceWithNoise(random(10 * 75 / 100, 40 * 50 / 100)); 
 
                  pktLen = buildAssocRequestPacket(packetBuffer, vd, targetSSID);
                  esp_wifi_80211_tx(WIFI_IF_STA, packetBuffer, pktLen, false);
                  vd.sequenceNumber = (vd.sequenceNumber + 1) % 4096;
                  
-                 // MODIFIED: Reduced junk packet duration by 25-50%
                  fillSilenceWithNoise(random(30 * 75 / 100, 100 * 50 / 100));
 
                  int burstCount = random(3, 12);
@@ -839,7 +981,6 @@ void loop() {
                      vd.sequenceNumber = (vd.sequenceNumber + 1) % 4096;
                      totalPacketCount++;
                      if (is5GHzBand) packets5G++; else packets2G++;
-                     // MODIFIED: Reduced junk packet duration by 25-50%
                      fillSilenceWithNoise(random(5 * 75 / 100, 20 * 50 / 100));
                  }
                  interactionCount++;
@@ -857,7 +998,7 @@ void loop() {
             }
         }
         
-        // MODIFIED: Router traffic rate is now dynamic (2% by default, 5% when soft cap (200) is reached)
+        // Router traffic rate is now dynamic (2% by default, 5% when soft cap (200) is reached)
         int beaconChance = 2; // Default 2%
         if (activeSSIDs.size() >= MAX_SSIDS_TO_LEARN) {
              beaconChance = 5; // User requested 5% for high-density simulation
@@ -877,7 +1018,6 @@ void loop() {
             if (is5GHzBand) packets5G++; else packets2G++;
         }
 
-        // MODIFIED: Reduced junk packet duration by 25-50%
         fillSilenceWithNoise(random(2 * 75 / 100, 10 * 50 / 100));
     }
     
@@ -886,6 +1026,6 @@ void loop() {
   
   if (currentMillis - lastUiUpdateTime > 2000) {
       lastUiUpdateTime = currentMillis;
-      updateDisplayStats();
+      updateDisplayStats(currentMillis); 
   }
 }
