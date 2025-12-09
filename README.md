@@ -1,3 +1,5 @@
+# A prototype 5ghz version has been uploaded. This readme does not reflect that. 
+
 # Ghost Walk: High-Fidelity Crowd Simulation
 
 > **⚠️ WARNING: READ BEFORE DEPLOYMENT**
