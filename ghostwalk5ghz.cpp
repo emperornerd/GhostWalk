@@ -1,10 +1,10 @@
 /*
  * PROJECT: Ghost Walk
  * HARDWARE: ESP32 (WiFi Shield) / ESP32-C5 (Dual Band)
- * VERSION: 9.3.8 - "Dynamic Mesh Decay"
+ * VERSION: 9.3.9 - "Dynamic Mesh Decay + ESP-NOW Support"
  * PURPOSE: High-density crowd simulation with forensic hardening + best-effort mesh relay.
  * FEATURES: Interleaved Dual-Band Hopping, Sticky RSSI, HT/VHT Beacons.
- * UPDATE: Implemented dynamic check intervals (10 min standby / 300ms active) controlled by MESH_DECAY_TIMEOUT_MS (10 min).
+ * UPDATE: Fixed mesh relay to capture 0xD0 Management Action Frames (ESP-NOW).
  */
 
 #include <WiFi.h>
@@ -276,20 +276,22 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// --- MESH SNIFFER (NEW) ---
+// --- MESH SNIFFER (NEW - UPDATED FOR ESP-NOW) ---
 void IRAM_ATTR meshSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!ENABLE_MESH_RELAY) return;
 
-    // Only look for Data or QoS Data frames
-    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC) return; 
+    // UPDATED: Look for Data, Misc, AND Management frames (ESP-NOW uses Action frames)
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC && type != WIFI_PKT_MGMT) return; 
 
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     uint8_t* frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
 
-    // Check for Frame Control: Type=Data (0x08) or QoS Data (0x88)
+    // Check for Frame Control: 
+    // Data (0x08), QoS Data (0x88)
+    // NEW: Management Action (0xD0) for ESP-NOW
     uint8_t frameType = frame[0] & 0xFC; 
-    if (frameType != 0x08 && frameType != 0x88 && frameType != 0x48) return; 
+    if (frameType != 0x08 && frameType != 0x88 && frameType != 0x48 && frameType != 0xD0) return; 
 
     // Minimum expected size for a complex data/mesh message 
     if (len < 100 || len > 1024) return;
@@ -659,7 +661,7 @@ void updateDisplayStats(unsigned long currentMillis) {
     tft.setCursor(5, 89); 
     tft.printf("Total Packets: %lu", totalPacketCount);
     tft.setCursor(5, 101); 
-    tft.printf("Junk: %lu | Relayed: %lu", junkPacketCount, meshRelayCount);
+    tft.printf("Junk: %lu", junkPacketCount); // REMOVED mixed Relayed counter from here
 
     unsigned long total = packets2G + packets5G;
     int p2g = (total > 0) ? (packets2G * 100 / total) : 0;
@@ -738,6 +740,11 @@ void updateDisplayStats(unsigned long currentMillis) {
         // Show the corrected, minimal long-term overhead when in 10-minute standby mode
         tft.printf("checking..."); 
     }
+
+    // ADDED: Explicit Rebroadcast Counter in the correct section
+    tft.setCursor(5, 211);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.printf("Total Relayed: %lu", meshRelayCount);
 }
 
 void setupDisplay() {
@@ -745,7 +752,7 @@ void setupDisplay() {
   tft.setRotation(1); tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
   tft.setCursor(5, 5);
-  tft.println("GHOST WALK v9.3.8"); // Updated version number
+  tft.println("GHOST WALK v9.3.9"); // Updated version number
   tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
