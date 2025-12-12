@@ -1,10 +1,10 @@
 /*
  * PROJECT: Ghost Walk
  * HARDWARE: ESP32 (WiFi Shield) / ESP32-C5 (Dual Band)
- * VERSION: 9.4.2 - "Radio Time Analytics" (Patched)
+ * VERSION: 9.4.1 - "Radio Time Analytics"
  * PURPOSE: High-density crowd simulation with forensic hardening + best-effort mesh relay.
  * FEATURES: Interleaved Dual-Band Hopping, Sticky RSSI, HT/VHT Beacons.
- * UPDATE: Fixed sender duplication (Data frame filtering) & Self-detection loop.
+ * UPDATE: Moved HW info to Band line. Added Radio Time Split (Mesh vs Core) & Cache Count.
  */
 
 #include <WiFi.h>
@@ -41,9 +41,9 @@
 #define ENABLE_MESH_RELAY true // Master switch for mesh functionality
 #define MESH_CHANNEL 1 
 // MESH_ACTIVE_INTERVAL_MS: Frequency of checks *while* a mesh is detected (Fast Check)
-const unsigned long MESH_ACTIVE_INTERVAL_MS = 600000; 
+const unsigned long MESH_ACTIVE_INTERVAL_MS = 4000; 
 // MESH_STANDBY_INTERVAL_MS: Frequency of checks *while* no mesh is detected (Slow Check)
-const unsigned long MESH_STANDBY_INTERVAL_MS = 20000;
+const unsigned long MESH_STANDBY_INTERVAL_MS = 10000;
 // Listen duration: Very short to minimize disruption
 const unsigned long MESH_CHECK_DURATION_MS = 100; 
 // Chance to rebroadcast a cached mesh packet during a Ghost Walk TX slot
@@ -134,7 +134,6 @@ QueueHandle_t meshQueue;
 unsigned long lastMeshCheckTime = 0;
 unsigned long lastMeshPacketTime = 0; // Tracks when the last packet was seen
 bool isMeshDetected = false; 
-uint8_t local_mac_addr[6]; // Store local MAC to prevent self-detection
 
 // NEW: Queue Structures
 struct CachedMessage {
@@ -320,31 +319,25 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// --- MESH SNIFFER (UPDATED: FIXED DOUBLE-COUNTING) ---
+// --- MESH SNIFFER (NEW - UPDATED FOR ESP-NOW) ---
 void IRAM_ATTR meshSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!ENABLE_MESH_RELAY) return;
 
-    // We ONLY care about Management frames (specifically Action frames) for ESP-NOW.
-    // Data frames (WIFI_PKT_DATA) are ignored to prevent counting standard HTTP/Data traffic.
-    if (type != WIFI_PKT_MGMT) return;
+    // UPDATED: Look for Data, Misc, AND Management frames (ESP-NOW uses Action frames)
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC && type != WIFI_PKT_MGMT) return; 
 
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     uint8_t* frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
 
-    // Strict Filter for ESP-NOW Action Frames
-    // Frame Control (Byte 0) must be 0xD0 (Action Frame)
-    if (frame[0] != 0xD0) return;
+    // Check for Frame Control: 
+    // Data (0x08), QoS Data (0x88)
+    // NEW: Management Action (0xD0) for ESP-NOW
+    uint8_t frameType = frame[0] & 0xFC; 
+    if (frameType != 0x08 && frameType != 0x88 && frameType != 0x48 && frameType != 0xD0) return; 
 
-    // Minimum expected size for ESP-NOW (Header + Tag + OUI + Content)
-    if (len < 40 || len > 1024) return;
-
-    // OPTIONAL: Verify Espressif OUI to be absolutely sure it is mesh traffic
-    // Action Frame Header: FC(2) + Dur(2) + Addr1(6) + Addr2(6) + Addr3(6) + Seq(2) = 24 Bytes
-    // Category Code is at offset 24 (Should be 127 for Vendor Specific)
-    // OUI is at offsets 25, 26, 27 (Should be 0x18, 0xFE, 0x34)
-    if (frame[24] != 127) return; 
-    if (frame[25] != 0x18 || frame[26] != 0xFE || frame[27] != 0x34) return;
+    // Minimum expected size for a complex data/mesh message 
+    if (len < 100 || len > 1024) return;
 
     MeshPacket mp;
     if (len <= 1024) {
@@ -802,7 +795,7 @@ void setupDisplay() {
   tft.setRotation(1); tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
   tft.setCursor(5, 5);
-  tft.println("GHOST WALK v9.4.2"); // Updated version number
+  tft.println("GHOST WALK v9.4.1"); // Updated version number
   tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -836,10 +829,6 @@ void checkAndListenForMesh() {
             if (mp.len >= 16) {
                 uint8_t senderMac[6];
                 memcpy(senderMac, &mp.payload[10], 6);
-
-                // --- FIX: SELF-DETECTION CHECK ---
-                // Do not count ourselves as a sender (fixes "and itself" count)
-                if (memcmp(senderMac, local_mac_addr, 6) == 0) continue; 
                 
                 bool senderKnown = false;
                 for (auto& s : recentSenders) {
@@ -906,9 +895,6 @@ void setup() {
 
   uint8_t mac_base[6];
   esp_read_mac(mac_base, ESP_MAC_WIFI_STA);
-  // Store local MAC specifically for the filter
-  memcpy(local_mac_addr, mac_base, 6);
-
   randomSeed(analogRead(0) * micros() + mac_base[5]);
   startTime = millis();
   
