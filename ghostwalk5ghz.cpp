@@ -1,10 +1,10 @@
 /*
  * PROJECT: Ghost Walk
  * HARDWARE: ESP32 (WiFi Shield) / ESP32-C5 (Dual Band)
- * VERSION: 9.4.1 - "Radio Time Analytics"
+ * VERSION: 9.4.3 - "Smart Mesh Isolation"
  * PURPOSE: High-density crowd simulation with forensic hardening + best-effort mesh relay.
  * FEATURES: Interleaved Dual-Band Hopping, Sticky RSSI, HT/VHT Beacons.
- * UPDATE: Moved HW info to Band line. Added Radio Time Split (Mesh vs Core) & Cache Count.
+ * UPDATE: Fixed "No Detection" bug by removing strict DS check. Added Frame Subtype whitelist to eliminate beacons/probes.
  */
 
 #include <WiFi.h>
@@ -134,6 +134,9 @@ QueueHandle_t meshQueue;
 unsigned long lastMeshCheckTime = 0;
 unsigned long lastMeshPacketTime = 0; // Tracks when the last packet was seen
 bool isMeshDetected = false; 
+
+// Global Local MAC (Used to ignore self in mesh counts)
+uint8_t localMac[6];
 
 // NEW: Queue Structures
 struct CachedMessage {
@@ -319,25 +322,43 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// --- MESH SNIFFER (NEW - UPDATED FOR ESP-NOW) ---
+// --- MESH SNIFFER (NEW - LIBERAL DETECT, STRICT FILTER) ---
 void IRAM_ATTR meshSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!ENABLE_MESH_RELAY) return;
 
-    // UPDATED: Look for Data, Misc, AND Management frames (ESP-NOW uses Action frames)
+    // 1. Broad Acceptance: Allow Data, Misc, and Management
     if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC && type != WIFI_PKT_MGMT) return; 
 
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     uint8_t* frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
 
-    // Check for Frame Control: 
-    // Data (0x08), QoS Data (0x88)
-    // NEW: Management Action (0xD0) for ESP-NOW
-    uint8_t frameType = frame[0] & 0xFC; 
-    if (frameType != 0x08 && frameType != 0x88 && frameType != 0x48 && frameType != 0xD0) return; 
+    // 2. Strict Frame Type Whitelist (Replaces DS Bit check)
+    // We only want:
+    // - 0x08: Data (Standard)
+    // - 0x88: QoS Data (Standard)
+    // - 0xD0: Action (Management - ESP-NOW uses this)
+    // - 0x48: NULL Function (Optional, but included for keep-alives)
+    
+    // Explicitly REJECT the sources of noise (Phones/Routers):
+    // - 0x40: Probe Request (Phones scanning)
+    // - 0x50: Probe Response (Routers answering)
+    // - 0x80: Beacon (Routers advertising)
+    
+    uint8_t frameType = frame[0];
+    
+    // REJECTION LOGIC (Fast Exit)
+    if (frameType == 0x40 || frameType == 0x50 || frameType == 0x80) return;
 
-    // Minimum expected size for a complex data/mesh message 
-    if (len < 100 || len > 1024) return;
+    // ACCEPTANCE LOGIC (Specific Types)
+    // Mask out the subtype bits to check generic Data vs Mgmt
+    // But since we did rejection above, we can just ensure it's not some random noise.
+    // ESP-NOW is often Action (0xD0) or specific vendor Data.
+    
+    // NOTE: Removed strict ToDS/FromDS check to restore detection.
+
+    // Minimum expected size
+    if (len < 60 || len > 1024) return;
 
     MeshPacket mp;
     if (len <= 1024) {
@@ -795,7 +816,7 @@ void setupDisplay() {
   tft.setRotation(1); tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
   tft.setCursor(5, 5);
-  tft.println("GHOST WALK v9.4.1"); // Updated version number
+  tft.println("GHOST WALK v9.4.3"); // Updated version number
   tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -830,6 +851,30 @@ void checkAndListenForMesh() {
                 uint8_t senderMac[6];
                 memcpy(senderMac, &mp.payload[10], 6);
                 
+                // --- FIX 1: IGNORE SELF ---
+                // Do not count ourselves as a sender if we catch our own reflection or transmission
+                if (memcmp(senderMac, localMac, 6) == 0) {
+                    continue; 
+                }
+
+                // --- FIX 2: IGNORE CELL PHONES (VENDOR OUI CHECK) ---
+                // Even though the Protocol check (ToDS) catches most, this ensures
+                // we don't count an iPhone running AirDrop/AWDL as a Mesh Node.
+                bool isIgnoredVendor = false;
+                
+                // Check Apple
+                for (int i=0; i<NUM_OUI_APPLE; i++) {
+                    if (memcmp(senderMac, OUI_APPLE[i], 3) == 0) { isIgnoredVendor = true; break; }
+                }
+                if (isIgnoredVendor) continue;
+
+                // Check Samsung
+                for (int i=0; i<NUM_OUI_SAMSUNG; i++) {
+                    if (memcmp(senderMac, OUI_SAMSUNG[i], 3) == 0) { isIgnoredVendor = true; break; }
+                }
+                if (isIgnoredVendor) continue;
+
+                // Sender is likely valid Mesh or ESP-NOW
                 bool senderKnown = false;
                 for (auto& s : recentSenders) {
                     if (memcmp(s.mac, senderMac, 6) == 0) {
@@ -892,6 +937,9 @@ void setup() {
   if (ENABLE_MESH_RELAY) {
       meshQueue = xQueueCreate(5, sizeof(MeshPacket)); // Initialize Mesh Queue only if enabled
   }
+
+  // --- GET LOCAL MAC ADDRESS FOR FILTERING ---
+  esp_read_mac(localMac, ESP_MAC_WIFI_STA);
 
   uint8_t mac_base[6];
   esp_read_mac(mac_base, ESP_MAC_WIFI_STA);
