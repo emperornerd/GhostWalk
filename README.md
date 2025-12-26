@@ -37,6 +37,7 @@ On ESP32-C5 hardware, the system utilizes both 2.4GHz and 5GHz bands.
 
 ### 2. Smart Mesh Isolation
 Includes a "Best-Effort" Mesh Relay designed for high-density environments.
+* **Integration:** This relay is designed to support the [esp32mesh](https://github.com/emperornerd/esp32mesh) project. If a compatible mesh is not detected, it functions as a stand-alone product.
 * **Smart Filtering:** The relay includes logic to ignore smartphones (Apple/Samsung) and valid mesh nodes, preventing the device from accidentally relaying AirDrop or personal hotspot traffic.
 * **Decay Timers:** Mesh data is cached but decays after 10 minutes to prevent "ghost echoes" of devices that have left the area.
 * **Dynamic Intervals:** Switches between fast checks (4000ms) when active and slow checks (10000ms) when in standby.
