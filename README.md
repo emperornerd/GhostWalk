@@ -1,4 +1,4 @@
-# A prototype 5ghz version has been uploaded. This readme does not reflect that. 
+# Readme has not been updated to reflect esp32-c5 compatibility update. TFT functionality only works on standard ESP32, intended for the 'cheap yellow display' 2.8" board. 5ghz functionality is believed working, but needs more testing. 
 
 # Ghost Walk: High-Fidelity Crowd Simulation
 
