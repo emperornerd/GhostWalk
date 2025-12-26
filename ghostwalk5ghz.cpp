@@ -7,19 +7,70 @@
  * UPDATE: Fixed "No Detection" bug by removing strict DS check. Added Frame Subtype whitelist to eliminate beacons/probes.
  */
 
+#ifndef HSPI_HOST
+  #define HSPI_HOST SPI2_HOST
+#endif
+#ifndef VSPI_HOST
+  #if defined(CONFIG_IDF_TARGET_ESP32C5)
+    #define VSPI_HOST SPI2_HOST
+    // FIX: Provide VSPI alias for C5 SPI library compatibility
+    #ifndef VSPI
+      #define VSPI SPI2_HOST
+    #endif
+  #else
+    #define VSPI_HOST SPI3_HOST
+  #endif
+#endif
+
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
 #include <esp_wifi_types.h> 
-#include <esp_mac.h> 
+#if __has_include(<esp_mac.h>)
+    #include <esp_mac.h>
+#endif
 #include <vector>
 #include <deque>
 #include <algorithm>
-#include <TFT_eSPI.h> 
-#include <SPI.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 
+// FIX: Disable TFT for ESP32-C5 (Headless Mode)
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    #define TFT_BLACK 0
+    #define TFT_YELLOW 0
+    #define TFT_RED 0
+    #define TFT_GREEN 0
+    #define TFT_WHITE 0
+    #define TFT_CYAN 0
+    #define TFT_ORANGE 0
+    #define TFT_LIGHTGREY 0
+    #define TFT_DARKGREY 0
+    
+    class TFT_eSPI {
+    public:
+        TFT_eSPI() {}
+        void init() {}
+        void setRotation(uint8_t r) {}
+        void fillScreen(uint32_t c) {}
+        void setTextColor(uint16_t c, uint32_t b = 0) {}
+        void setTextSize(uint8_t s) {}
+        void setCursor(int16_t x, int16_t y) {}
+        void printf(const char *fmt, ...) {}
+        void println(const char *s) {}
+        void fillRect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c) {}
+        void drawRect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c) {}
+        int32_t width() { return 0; }
+        int32_t height() { return 0; }
+    };
+#else
+    #include <TFT_eSPI.h> 
+#endif
+
+// FIX: Exclude SPI library for C5 to prevent "VSPI not declared" errors in SPI.cpp
+#if !defined(CONFIG_IDF_TARGET_ESP32C5)
+  #include <SPI.h>
+#endif
+
+#include "freertos/FreeRTOS.h"
 // --- HARDWARE DETECTION ---
 #if defined(CONFIG_IDF_TARGET_ESP32C5)
     #define HARDWARE_IS_C5 true
@@ -322,42 +373,33 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// --- MESH SNIFFER (NEW - LIBERAL DETECT, STRICT FILTER) ---
+// --- MESH SNIFFER (UPDATED - NOISE FILTERING) ---
 void IRAM_ATTR meshSnifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!ENABLE_MESH_RELAY) return;
-
     // 1. Broad Acceptance: Allow Data, Misc, and Management
-    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC && type != WIFI_PKT_MGMT) return; 
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MISC && type != WIFI_PKT_MGMT) return;
 
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     uint8_t* frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
 
-    // 2. Strict Frame Type Whitelist (Replaces DS Bit check)
-    // We only want:
-    // - 0x08: Data (Standard)
-    // - 0x88: QoS Data (Standard)
-    // - 0xD0: Action (Management - ESP-NOW uses this)
-    // - 0x48: NULL Function (Optional, but included for keep-alives)
-    
-    // Explicitly REJECT the sources of noise (Phones/Routers):
+    uint8_t frameType = frame[0];
+    uint8_t frameFlags = frame[1]; // Flags are in the second byte of the MAC header
+
+    // 1. REJECTION LOGIC (Fast Exit for non-mesh types)
     // - 0x40: Probe Request (Phones scanning)
     // - 0x50: Probe Response (Routers answering)
     // - 0x80: Beacon (Routers advertising)
-    
-    uint8_t frameType = frame[0];
-    
-    // REJECTION LOGIC (Fast Exit)
     if (frameType == 0x40 || frameType == 0x50 || frameType == 0x80) return;
 
-    // ACCEPTANCE LOGIC (Specific Types)
-    // Mask out the subtype bits to check generic Data vs Mgmt
-    // But since we did rejection above, we can just ensure it's not some random noise.
-    // ESP-NOW is often Action (0xD0) or specific vendor Data.
-    
-    // NOTE: Removed strict ToDS/FromDS check to restore detection.
+    // 2. ENCRYPTION FILTER (Fixes "unsupport crypto frame" error)
+    // If the "Protected" bit (0x40) is set, this is encrypted traffic.
+    // We cannot relay encrypted frames (we don't have the keys), and capturing them
+    // triggers driver errors when they are malformed or random noise.
+    // This allows OPEN ESP-NOW frames to pass, but blocks WPA2/3 and Ghost Noise.
+    if (frameFlags & 0x40) return; 
 
-    // Minimum expected size
+    // 3. Minimum expected size check (prevents tiny fragments)
     if (len < 60 || len > 1024) return;
 
     MeshPacket mp;
@@ -705,57 +747,92 @@ int buildBeaconPacket(uint8_t* buf, uint8_t* mac, const String& ssid, int channe
 
 // --- DISPLAY (MODIFIED for dynamic mesh stats) ---
 void updateDisplayStats(unsigned long currentMillis) {
-    tft.fillRect(5, 40, 230, 200, TFT_BLACK); 
-    tft.setTextSize(1);
-    
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.setCursor(5, 50); tft.printf("--- TRAFFIC METRICS ---"); 
-    
-    if (lowMemoryMode) tft.setTextColor(TFT_RED, TFT_BLACK);
-    else tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    
-    tft.setCursor(5, 65); 
-    tft.printf("Free RAM: %d KB %s", ESP.getFreeHeap()/1024, lowMemoryMode ? "[LOW]" : ""); 
-    
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setCursor(5, 77); 
-    tft.printf("Active: %d | Dormant: %d", activeSwarm.size(), dormantSwarm.size());
-    
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(5, 89); 
-    tft.printf("Total Packets: %lu", totalPacketCount);
-    tft.setCursor(5, 101); 
-    tft.printf("Junk: %lu", junkPacketCount); 
+    // --- SERIAL HEADER (Runs on ALL) ---
+    Serial.println("\n--- [STATS UPDATE] ---");
 
+    // --- TFT BACKGROUND (Standard ESP32 Only) ---
+    if (!HARDWARE_IS_C5) {
+        tft.fillRect(5, 40, 230, 200, TFT_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setCursor(5, 50); 
+        tft.printf("--- TRAFFIC METRICS ---"); 
+    }
+    Serial.println("--- TRAFFIC METRICS ---"); 
+    
+    // --- MEMORY STATS ---
+    if (!HARDWARE_IS_C5) {
+        if (lowMemoryMode) tft.setTextColor(TFT_RED, TFT_BLACK);
+        else tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setCursor(5, 65);
+        tft.printf("Free RAM: %d KB %s", ESP.getFreeHeap()/1024, lowMemoryMode ? "[LOW]" : ""); 
+    }
+    Serial.printf("Free RAM: %d KB %s\n", ESP.getFreeHeap()/1024, lowMemoryMode ? "[LOW]" : ""); 
+    
+    // --- SWARM STATS ---
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setCursor(5, 77);
+        tft.printf("Active: %d | Dormant: %d", activeSwarm.size(), dormantSwarm.size());
+    }
+    Serial.printf("Active: %d | Dormant: %d\n", activeSwarm.size(), dormantSwarm.size());
+    
+    // --- PACKET COUNTS ---
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(5, 89); 
+        tft.printf("Total Packets: %lu", totalPacketCount);
+        tft.setCursor(5, 101); 
+        tft.printf("Junk: %lu", junkPacketCount);
+    }
+    Serial.printf("Total Packets: %lu\n", totalPacketCount);
+    Serial.printf("Junk: %lu\n", junkPacketCount);
+
+    // --- BAND CALCULATIONS ---
     unsigned long total = packets2G + packets5G;
     int p2g = (total > 0) ? (packets2G * 100 / total) : 0;
     int p5g = (total > 0) ? (packets5G * 100 / total) : 0;
-    
-    // UPDATED BAND LINE: Already uses [Value%] format
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setCursor(5, 115); 
     String hwType = HARDWARE_IS_C5 ? "Dual" : "Single";
-    tft.printf("Band: 2.4G[%d%%] 5G[%d%%] (%s)", p2g, p5g, hwType.c_str());
-
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.setCursor(5, 127); 
-    tft.printf("Found SSIDs: %lu / %d", learnedDataCount, MAX_SSIDS_TO_LEARN);
     
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.setCursor(5, 139); 
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setCursor(5, 115); 
+        tft.printf("Band: 2.4G[%d%%] 5G[%d%%] (%s)", p2g, p5g, hwType.c_str());
+    }
+    Serial.printf("Band: 2.4G[%d%%] 5G[%d%%] (%s)\n", p2g, p5g, hwType.c_str());
+
+    // --- SSID LEARNING ---
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+        tft.setCursor(5, 127); 
+        tft.printf("Found SSIDs: %lu / %d", learnedDataCount, MAX_SSIDS_TO_LEARN);
+    }
+    Serial.printf("Found SSIDs: %lu / %d\n", learnedDataCount, MAX_SSIDS_TO_LEARN);
+    
     String truncSSID = lastLearnedSSID;
     if (truncSSID.length() > 22) truncSSID = truncSSID.substring(0, 22) + "...";
-    tft.printf("Last: %s", truncSSID.c_str());
     
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setCursor(5, 139); 
+        tft.printf("Last: %s", truncSSID.c_str());
+    }
+    Serial.printf("Last: %s\n", truncSSID.c_str());
+
+    // --- UPTIME ---
     unsigned long upSec = (currentMillis - startTime) / 1000;
     int hr = upSec / 3600;
     int mn = (upSec % 3600) / 60;
     int sc = upSec % 60;
     
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.setCursor(5, 155); 
-    tft.printf("Uptime: %02d:%02d:%02d", hr, mn, sc);
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setCursor(5, 155);
+        tft.printf("Uptime: %02d:%02d:%02d", hr, mn, sc);
+    }
+    Serial.printf("Uptime: %02d:%02d:%02d\n", hr, mn, sc);
 
+    // --- IDLE & MONITORING ---
     unsigned long runTime = currentMillis - startTime;
     float idle = 0;
     if(runTime > 0) idle = 100.0 * (1.0 - ((float)activeTimeTotal / runTime));
@@ -764,66 +841,95 @@ void updateDisplayStats(unsigned long currentMillis) {
     int monPct = 0;
     if(totalAct > 0) monPct = (sniffedPacketCount * 100) / totalAct;
     
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(5, 165); 
-    // MODIFIED: Changed "M/B: %d/%d%%" to "M[%d%%] B[%d%%]" for consistency
-    tft.printf("Idle: %0.1f%% | M[%d%%] B[%d%%]", idle, monPct, 100-monPct);
+    if (!HARDWARE_IS_C5) {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(5, 165);
+        tft.printf("Idle: %0.1f%% | M[%d%%] B[%d%%]", idle, monPct, 100-monPct);
+    }
+    Serial.printf("Idle: %0.1f%% | M[%d%%] B[%d%%]\n", idle, monPct, 100-monPct);
 
-    // NEW LINE: Cache Size & Radio Time Split (Already uses [Value%] format)
-    tft.setCursor(5, 175); 
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    // --- CACHE & RADIO ---
     unsigned long totalRadio = meshRadioTime + ghostRadioTime;
     int meshPct = (totalRadio > 0) ? (meshRadioTime * 100 / totalRadio) : 0;
     int ghostPct = (totalRadio > 0) ? 100 - meshPct : 0;
-    tft.printf("Cache: %d | Radio: M[%d%%] G[%d%%]", meshCache.size(), meshPct, ghostPct);
     
-    // NEW: Mesh Status & Dedication (ENHANCED DYNAMIC DISPLAY)
-    tft.setCursor(5, 187); 
+    if (!HARDWARE_IS_C5) {
+        tft.setCursor(5, 175); 
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.printf("Cache: %d | Radio: M[%d%%] G[%d%%]", meshCache.size(), meshPct, ghostPct);
+    }
+    Serial.printf("Cache: %d | Radio: M[%d%%] G[%d%%]\n", meshCache.size(), meshPct, ghostPct);
+    
+    // --- MESH STATUS (Enhanced Dynamic Display) ---
+    if (!HARDWARE_IS_C5) tft.setCursor(5, 187);
+
     if (!ENABLE_MESH_RELAY) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.printf("MESH RELAY: DISABLED BY FLAG");
-        tft.setCursor(5, 199); 
-        tft.printf("Dedication: 0%%");
+        if (!HARDWARE_IS_C5) {
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.printf("MESH RELAY: DISABLED BY FLAG");
+            tft.setCursor(5, 199);
+            tft.printf("Dedication: 0%%");
+        }
+        Serial.println("MESH RELAY: DISABLED BY FLAG");
+        Serial.println("Dedication: 0%");
     } else if(isMeshDetected) {
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        // Show remaining time based on decay timeout (10 minutes)
         unsigned long timeRemaining = (MESH_DECAY_TIMEOUT_MS > (currentMillis - lastMeshPacketTime)) 
                                     ? (MESH_DECAY_TIMEOUT_MS - (currentMillis - lastMeshPacketTime)) : 0;
         
-        tft.printf("MESH RELAY: ACTIVE (T-%lums)", timeRemaining);
-        tft.setCursor(5, 199); 
-        // Show Queue Status
-        tft.printf("Q: %d/%d | Senders(5m): %d", meshCache.size(), MAX_MESH_QUEUE_SIZE, recentSenders.size()); 
+        if (!HARDWARE_IS_C5) {
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.printf("MESH RELAY: ACTIVE (T-%lums)", timeRemaining);
+            tft.setCursor(5, 199);
+            tft.printf("Q: %d/%d | Senders(5m): %d", meshCache.size(), MAX_MESH_QUEUE_SIZE, recentSenders.size());
+        }
+        Serial.printf("MESH RELAY: ACTIVE (T-%lums)\n", timeRemaining);
+        Serial.printf("Q: %d/%d | Senders(5m): %d\n", meshCache.size(), MAX_MESH_QUEUE_SIZE, recentSenders.size());
     } else {
-        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-        // When inactive, show the T-minus countdown for the next 10-minute check
         unsigned long timeRemaining = (MESH_STANDBY_INTERVAL_MS > (currentMillis - lastMeshCheckTime)) 
                                     ? (MESH_STANDBY_INTERVAL_MS - (currentMillis - lastMeshCheckTime)) : 0;
         
-        tft.printf("MESH RELAY: STANDBY | Check T-%lus", timeRemaining / 1000);
-        tft.setCursor(5, 199); 
-        tft.printf("checking..."); 
+        if (!HARDWARE_IS_C5) {
+            tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+            tft.printf("MESH RELAY: STANDBY | Check T-%lus", timeRemaining / 1000);
+            tft.setCursor(5, 199); 
+            tft.printf("checking...");
+        }
+        Serial.printf("MESH RELAY: STANDBY | Check T-%lus\n", timeRemaining / 1000);
+        Serial.println("checking...");
     }
 
-    // ADDED: Explicit Rebroadcast Counter
-    tft.setCursor(5, 211);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.printf("Total Relayed: %lu", meshRelayCount);
+    // --- REBROADCAST COUNTER ---
+    if (!HARDWARE_IS_C5) {
+        tft.setCursor(5, 211);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.printf("Total Relayed: %lu", meshRelayCount);
+    }
+    Serial.printf("Total Relayed: %lu\n", meshRelayCount);
 }
 
 void setupDisplay() {
-  tft.init();
-  tft.setRotation(1); tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_ORANGE, TFT_BLACK); tft.setTextSize(2);
-  tft.setCursor(5, 5);
-  tft.println("GHOST WALK v9.4.3"); // Updated version number
-  tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  if (!HARDWARE_IS_C5) {
+      tft.init();
+      tft.setRotation(1); 
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_ORANGE, TFT_BLACK); 
+      tft.setTextSize(2);
+      tft.setCursor(5, 5);
+      tft.println("GHOST WALK v9.4.3");
+      tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setCursor(5, 30); 
+      tft.printf("HW: Standard (2.4G)");
+  }
   
-  tft.setCursor(5, 30); 
-  if (HARDWARE_IS_C5) tft.printf("HW: ESP32-C5 (Dual)");
-  else tft.printf("HW: Standard (2.4G)");
+  // Serial Init Info
+  Serial.println("GHOST WALK v9.4.3");
+  if (HARDWARE_IS_C5) {
+    Serial.println("HW: ESP32-C5 (Dual)");
+  } else {
+    Serial.println("HW: Standard (2.4G)");
+  }
   
   updateDisplayStats(millis()); 
 }
