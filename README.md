@@ -10,7 +10,7 @@
 
 **Ghost Walk** is an ESP32-based firmware designed to generate massive amounts of realistic IEEE 802.11 (WiFi) cover traffic.
 
-**New Capabilities:** The project now supports **Dual-Band (2.4GHz / 5GHz)** operation on ESP32-C5 hardware, featuring "Smart Mesh Isolation" for forensic hardening.
+**New Capabilities:** The project now supports **Dual-Band (2.4GHz / 5GHz)** operation on ESP32-C5 hardware, and forensic hardening.
 
 Unlike standard traffic generators that produce random, easily filterable noise, Ghost Walk prioritizes **Forensic Validity**. It uses strict "Era Enforcement" to ensure that simulated devices match their hardware profiles. A virtual device mimicking an iPhone 12 behaves exactly like a modern WiFi 6 device, while a virtual legacy IoT device restricts itself to WiFi 4 behaviors.
 
@@ -35,12 +35,12 @@ On ESP32-C5 hardware, the system utilizes both 2.4GHz and 5GHz bands.
 * **5GHz Coverage:** Broadcasts on channels 36–165 using appropriate VHT (Very High Throughput) tags.
 * **Band Fidelity:** Legacy virtual devices stay on 2.4GHz, while Modern devices hop between bands naturally.
 
-### 2. Smart Mesh Isolation
-Includes a "Best-Effort" Mesh Relay designed for high-density environments.
-* **Integration:** This relay is designed to support the [esp32mesh](https://github.com/emperornerd/esp32mesh) project. If a compatible mesh is not detected, it functions as a stand-alone product.
-* **Smart Filtering:** The relay includes logic to ignore smartphones (Apple/Samsung) and valid mesh nodes, preventing the device from accidentally relaying AirDrop or personal hotspot traffic.
+### 2. Support for related protest mesh project
+Includes a "Best-Effort" Mesh Relay designed for expanding mesh range or filling out thin mesh areas.
+* **Integration:** This relay is designed to support the [esp32mesh](https://github.com/emperornerd/esp32mesh) project. If a compatible mesh is not detected, it functions as a stand-alone product without mesh relay.
+* **Smart Filtering:** The relay includes logic to ignore connected smartphones (eg. WPA2, WPA3 connections), preventing the device from accidentally relaying AirDrop or personal hotspot traffic.
 * **Decay Timers:** Mesh data is cached but decays after 10 minutes to prevent "ghost echoes" of devices that have left the area.
-* **Dynamic Intervals:** Switches between fast checks (4000ms) when active and slow checks (10000ms) when in standby.
+* **Dynamic Intervals:** Switches between fast checks when active and slow checks when in standby.
 
 ### 3. Strict Era & Generation Enforcement
 The firmware assigns every virtual device a specific generation (`GEN_LEGACY`, `GEN_COMMON`, `GEN_MODERN`) and Platform (`IOS`, `ANDROID`, `IoT`).
@@ -89,4 +89,4 @@ The system automatically manages resources based on heap availability.
 
 // --- POOL SETTINGS ---
 const int TARGET_ACTIVE_POOL = 1500;   // Active devices in RAM
-const int TARGET_DORMANT_POOL = 3000;  // Devices "waiting" to arrive
+const int TARGET_DORMANT_POOL = 3000;  // Previously active devices "waiting" to either be dropped or re-introduced into the crowd 
